@@ -64,6 +64,13 @@ const RUNTIMES: &[Runtime] = &[
     Runtime { names: &["lua"], extension: "lua", program: "lua", leading_args: &[] },
     Runtime { names: &["go"], extension: "go", program: "go", leading_args: &["run"] },
     Runtime { names: &["typescript", "ts"], extension: "ts", program: "tsx", leading_args: &[] },
+    Runtime { names: &["rust", "rs"], extension: "rs", program: "rustc", leading_args: &[] },
+    Runtime {
+        names: &["csharp", "cs", "dotnet"],
+        extension: "cs",
+        program: "dotnet",
+        leading_args: &[],
+    },
 ];
 
 fn lookup(language: &str) -> ToolResult<&'static Runtime> {
@@ -77,6 +84,16 @@ fn lookup(language: &str) -> ToolResult<&'static Runtime> {
     })
 }
 
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 #[async_trait]
 impl NativeTool for EvalTools {
     fn descriptors(&self) -> Vec<Tool> {
@@ -84,8 +101,7 @@ impl NativeTool for EvalTools {
         vec![Tool::new(
             "eval_code",
             format!(
-                "Runs a short script and returns its stdout, stderr and exit code. Supported \
-                 languages: {}. Disabled unless the operator has set allow_code_execution.",
+                "Run a small script in a sandbox and capture stdout/stderr.\n\nSupported languages: {}\n\nExecution is denied unless `tools.allow_code_execution = true` is set in configuration.",
                 languages.join(", ")
             ),
             json!({
@@ -93,17 +109,22 @@ impl NativeTool for EvalTools {
                 "properties": {
                     "language": {
                         "type": "string",
-                        "description": "One of the supported languages",
-                        "enum": RUNTIMES.iter().flat_map(|r| r.names.iter().copied()).collect::<Vec<_>>()
+                        "description": format!("One of: {}", languages.join(", ")),
                     },
-                    "code": { "type": "string", "description": "Source to execute" },
-                    "stdin": { "type": "string", "description": "Text piped to the script's stdin" },
+                    "code": {
+                        "type": "string",
+                        "description": "Script body to execute",
+                    },
+                    "stdin": {
+                        "type": "string",
+                        "description": "Optional text to feed to standard input",
+                    },
                     "timeout_seconds": {
                         "type": "integer",
-                        "description": "Kill the process after this long (default 30)"
-                    }
+                        "description": "Wall-clock timeout in seconds (default: 30, maximum: 600)",
+                    },
                 },
-                "required": ["language", "code"]
+                "required": ["language", "code"],
             }),
         )]
     }
@@ -138,10 +159,56 @@ async fn evaluate(arguments: &Value) -> ToolResult<CallToolResult> {
         .await
         .map_err(|e| ToolError::Failed(format!("could not write the script: {e}")))?;
 
-    let mut command = Command::new(runtime.program);
+    let mut command;
+    let backend_name: String;
+
+    if runtime.names.contains(&"rust") {
+        if command_exists("rust-script") {
+            backend_name = "rust-script".to_string();
+            command = Command::new("rust-script");
+            command.arg(&script);
+        } else {
+            backend_name = "rustc".to_string();
+            let out_bin = workspace.path().join("main_bin");
+            command = Command::new("sh");
+            command.arg("-c");
+            command.arg("rustc \"$1\" -o \"$2\" && exec \"$2\"");
+            command.arg("--");
+            command.arg(&script);
+            command.arg(&out_bin);
+        }
+    } else if runtime.names.contains(&"csharp") {
+        if command_exists("dotnet-script") {
+            backend_name = "dotnet-script".to_string();
+            command = Command::new("dotnet-script");
+            command.arg(&script);
+        } else {
+            backend_name = "dotnet".to_string();
+            let csproj = workspace.path().join("main.csproj");
+            let proj_xml = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+</Project>"#;
+            tokio::fs::write(&csproj, proj_xml)
+                .await
+                .map_err(|e| ToolError::Failed(format!("could not create .csproj: {e}")))?;
+
+            command = Command::new("dotnet");
+            command.args(["run", "--project"]);
+            command.arg(&csproj);
+        }
+    } else {
+        backend_name = runtime.program.to_string();
+        command = Command::new(runtime.program);
+        command.args(runtime.leading_args);
+        command.arg(&script);
+    }
+
     command
-        .args(runtime.leading_args)
-        .arg(&script)
         .current_dir(workspace.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -153,8 +220,8 @@ async fn evaluate(arguments: &Value) -> ToolResult<CallToolResult> {
     command.env("TMPDIR", workspace.path());
 
     let mut child = command.spawn().map_err(|e| ToolError::Unavailable {
-        backend: runtime.program.to_string(),
-        reason: format!("could not start {}: {e}", runtime.program),
+        backend: backend_name,
+        reason: format!("could not start execution: {e}"),
     })?;
 
     if let Some(mut stdin) = child.stdin.take() {
