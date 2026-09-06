@@ -65,10 +65,17 @@ const RUNTIMES: &[Runtime] = &[
     Runtime { names: &["go"], extension: "go", program: "go", leading_args: &["run"] },
     Runtime { names: &["typescript", "ts"], extension: "ts", program: "tsx", leading_args: &[] },
     Runtime { names: &["rust", "rs"], extension: "rs", program: "rustc", leading_args: &[] },
+    Runtime { names: &["rust-script"], extension: "rs", program: "rust-script", leading_args: &[] },
     Runtime {
         names: &["csharp", "cs", "dotnet"],
         extension: "cs",
         program: "dotnet",
+        leading_args: &[],
+    },
+    Runtime {
+        names: &["dotnet-script"],
+        extension: "cs",
+        program: "dotnet-script",
         leading_args: &[],
     },
     Runtime { names: &["java"], extension: "java", program: "java", leading_args: &[] },
@@ -128,31 +135,17 @@ fn command_exists(cmd: &str) -> bool {
 }
 
 fn build_rust_command(script: &std::path::Path, workspace: &std::path::Path) -> (Command, String) {
-    if command_exists("rust-script") {
-        let mut cmd = Command::new("rust-script");
-        cmd.arg(script);
-        (cmd, "rust-script".to_string())
-    } else {
-        let out_bin = workspace.join("main_bin");
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "rustc \"$1\" -o \"$2\" && exec \"$2\"", "--"]);
-        cmd.arg(script);
-        cmd.arg(&out_bin);
-        (cmd, "rustc".to_string())
-    }
+    let out_bin = workspace.join("main_bin");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "rustc \"$1\" -o \"$2\" && exec \"$2\"", "--"]);
+    cmd.arg(script);
+    cmd.arg(&out_bin);
+    (cmd, "rustc".to_string())
 }
 
-async fn build_csharp_command(
-    script: &std::path::Path,
-    workspace: &std::path::Path,
-) -> ToolResult<(Command, String)> {
-    if command_exists("dotnet-script") {
-        let mut cmd = Command::new("dotnet-script");
-        cmd.arg(script);
-        Ok((cmd, "dotnet-script".to_string()))
-    } else {
-        let csproj = workspace.join("main.csproj");
-        let proj_xml = r#"<Project Sdk="Microsoft.NET.Sdk">
+async fn build_csharp_command(workspace: &std::path::Path) -> ToolResult<(Command, String)> {
+    let csproj = workspace.join("main.csproj");
+    let proj_xml = r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
@@ -160,15 +153,14 @@ async fn build_csharp_command(
     <Nullable>enable</Nullable>
   </PropertyGroup>
 </Project>"#;
-        tokio::fs::write(&csproj, proj_xml)
-            .await
-            .map_err(|e| ToolError::Failed(format!("could not create .csproj: {e}")))?;
+    tokio::fs::write(&csproj, proj_xml)
+        .await
+        .map_err(|e| ToolError::Failed(format!("could not create .csproj: {e}")))?;
 
-        let mut cmd = Command::new("dotnet");
-        cmd.args(["run", "--project"]);
-        cmd.arg(&csproj);
-        Ok((cmd, "dotnet".to_string()))
-    }
+    let mut cmd = Command::new("dotnet");
+    cmd.args(["run", "--project"]);
+    cmd.arg(&csproj);
+    Ok((cmd, "dotnet".to_string()))
 }
 
 fn build_c_command(script: &std::path::Path, workspace: &std::path::Path) -> (Command, String) {
@@ -223,7 +215,7 @@ async fn build_command(
     if runtime.names.contains(&"rust") {
         Ok(build_rust_command(script, workspace))
     } else if runtime.names.contains(&"csharp") {
-        build_csharp_command(script, workspace).await
+        build_csharp_command(workspace).await
     } else if runtime.names.contains(&"c") {
         Ok(build_c_command(script, workspace))
     } else if runtime.names.contains(&"cpp") {
@@ -559,7 +551,9 @@ mod tests {
         ("go", "package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"ok\")}"),
         ("typescript", r#"console.log("ok")"#),
         ("rust", r#"fn main(){println!("ok");}"#),
+        ("rust-script", r#"fn main(){println!("ok");}"#),
         ("csharp", r#"System.Console.WriteLine("ok");"#),
+        ("dotnet-script", r#"System.Console.WriteLine("ok");"#),
         (
             "java",
             "public class Main { public static void main(String[] args) { System.out.println(\"ok\"); } }",
@@ -592,8 +586,8 @@ mod tests {
     fn toolchain_present(language: &str) -> bool {
         let runtime = lookup(language).expect("snippet names a known language");
         match language {
-            "rust" => which("rustc").is_some() || which("rust-script").is_some(),
-            "csharp" => which("dotnet").is_some() || which("dotnet-script").is_some(),
+            "rust" => which("rustc").is_some(),
+            "csharp" => which("dotnet").is_some(),
             "c" => which("gcc").is_some() || which("clang").is_some() || which("cc").is_some(),
             "cpp" => which("g++").is_some() || which("clang++").is_some() || which("c++").is_some(),
             "fortran" => which("gfortran").is_some(),
@@ -662,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_compiler_error_is_reported_rather_than_swallowed() {
-        if which("rustc").is_none() && which("rust-script").is_none() {
+        if which("rustc").is_none() {
             return;
         }
         let result = EvalTools
