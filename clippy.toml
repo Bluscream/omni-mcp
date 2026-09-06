@@ -1,0 +1,3 @@
+# Clippy settings for omni-mcp
+# Function length limit: 100 lines max per function
+too-many-lines-threshold = 100

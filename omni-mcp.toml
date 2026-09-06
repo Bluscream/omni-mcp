@@ -1,0 +1,33 @@
+# omni-mcp Configuration
+# High-performance consolidated MCP gateway
+
+[server]
+host = "127.0.0.1"
+port = 8080
+
+# -------------------------------------------------------------------
+# HTTP / SSE Remote Proxies (Pass-through to external MCP endpoints)
+# -------------------------------------------------------------------
+[[proxies]]
+name = "omniroute"
+url = "http://192.168.2.11:20128/api/mcp/sse"
+token = "${OMNIROUTE_TOKEN}"
+
+[[proxies]]
+name = "homeassistant"
+url = "http://192.168.2.4:8123/api/mcp"
+bearer = "${HOME_ASSISTANT_TOKEN}"
+
+[[proxies]]
+name = "vrcosc"
+url = "http://127.0.0.1:11370/mcp"
+
+# -------------------------------------------------------------------
+# Subprocess Sidecars (Local Node / Python / Binary MCP workers)
+# -------------------------------------------------------------------
+# Easily add any new MCP server below:
+# [[sidecars]]
+# name = "browser-control"
+# command = "node"
+# args = ["/run/media/system/Data/Projects/MCPs/browser-control-mcp/mcp-server/dist/server.js"]
+# lazy = true
