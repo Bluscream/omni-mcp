@@ -1,63 +1,89 @@
 #!/usr/bin/env bash
+#
+# Build, verify and optionally install omni-mcp.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BINARY_PATH="$PROJECT_DIR/target/release/omni-mcp"
-INSTALL_BIN_DIR="$HOME/.local/bin"
-INSTALL_CONFIG_DIR="$HOME/.config/omni-mcp"
+BINARY="$PROJECT_DIR/target/release/omni-mcp"
+INSTALL_BIN_DIR="${OMNI_MCP_BIN_DIR:-$HOME/.local/bin}"
+INSTALL_CONFIG_DIR="${OMNI_MCP_CONFIG_DIR:-$HOME/.config/omni-mcp}"
 
-DEPLOY=false
+deploy=false
+skip_checks=false
+
+usage() {
+    cat <<USAGE
+Usage: ${0##*/} [--deploy] [--skip-checks]
+
+  --deploy       Install the release binary to $INSTALL_BIN_DIR/omni-mcp
+                 and seed $INSTALL_CONFIG_DIR/omni-mcp.toml if absent.
+  --skip-checks  Skip clippy and the test suite. Not recommended.
+  --help         Show this message.
+
+Environment:
+  OMNI_MCP_BIN_DIR      Install prefix for the binary.
+  OMNI_MCP_CONFIG_DIR   Install prefix for the configuration.
+USAGE
+}
 
 for arg in "$@"; do
     case "$arg" in
-        --deploy)
-            DEPLOY=true
-            ;;
-        --help|-h)
-            echo "Usage: $0 [--deploy]"
-            echo ""
-            echo "Options:"
-            echo "  --deploy    Compiles release binary and installs it to $INSTALL_BIN_DIR/omni-mcp"
-            echo "  --help      Show this help message"
-            exit 0
-            ;;
-        *)
-            echo "Unknown argument: $arg"
-            exit 1
-            ;;
+        --deploy) deploy=true ;;
+        --skip-checks) skip_checks=true ;;
+        --help | -h) usage; exit 0 ;;
+        *) echo "unknown argument: $arg" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-echo "==> Building omni-mcp in release mode..."
 cd "$PROJECT_DIR"
-cargo clippy --quiet
-cargo test --quiet
-cargo build --release
 
-if [ ! -f "$BINARY_PATH" ]; then
-    echo "Error: Release binary not found at $BINARY_PATH"
+if [ "$skip_checks" = false ]; then
+    echo "==> clippy"
+    cargo clippy --all-targets --locked -- -D warnings
+
+    echo "==> tests"
+    cargo test --locked
+fi
+
+echo "==> release build"
+cargo build --release --locked
+
+if [ ! -x "$BINARY" ]; then
+    echo "error: expected a release binary at $BINARY" >&2
     exit 1
 fi
 
-echo "✓ Build completed successfully!"
+# A binary that cannot answer --version is not one worth installing.
+"$BINARY" --version >/dev/null
+echo "==> built $("$BINARY" --version)"
 
-if [ "$DEPLOY" = true ]; then
-    echo "==> Deploying omni-mcp to system paths..."
-    
-    mkdir -p "$INSTALL_BIN_DIR" "$INSTALL_CONFIG_DIR"
-    
-    cp "$BINARY_PATH" "$INSTALL_BIN_DIR/omni-mcp.new"
-    mv -f "$INSTALL_BIN_DIR/omni-mcp.new" "$INSTALL_BIN_DIR/omni-mcp"
-    chmod +x "$INSTALL_BIN_DIR/omni-mcp"
-    
-    if [ -f "$PROJECT_DIR/omni-mcp.toml" ] && [ ! -f "$INSTALL_CONFIG_DIR/omni-mcp.toml" ]; then
-        cp "$PROJECT_DIR/omni-mcp.toml" "$INSTALL_CONFIG_DIR/omni-mcp.toml"
-        echo "✓ Copied omni-mcp.toml to $INSTALL_CONFIG_DIR/omni-mcp.toml"
-    fi
-
-    echo "✓ Binary deployed to $INSTALL_BIN_DIR/omni-mcp"
-    echo "✓ Testing deployed binary..."
-    "$INSTALL_BIN_DIR/omni-mcp" --help >/dev/null && echo "✓ Deployed binary is working!"
+if [ "$deploy" = false ]; then
+    echo "Run with --deploy to install."
+    exit 0
 fi
+
+echo "==> installing to $INSTALL_BIN_DIR"
+mkdir -p "$INSTALL_BIN_DIR" "$INSTALL_CONFIG_DIR"
+
+# Install via a temporary name and rename, so a running process is replaced
+# atomically rather than being overwritten underneath itself.
+install -m 0755 "$BINARY" "$INSTALL_BIN_DIR/.omni-mcp.new"
+mv -f "$INSTALL_BIN_DIR/.omni-mcp.new" "$INSTALL_BIN_DIR/omni-mcp"
+
+if [ ! -f "$INSTALL_CONFIG_DIR/omni-mcp.toml" ]; then
+    install -m 0600 "$PROJECT_DIR/omni-mcp.toml" "$INSTALL_CONFIG_DIR/omni-mcp.toml"
+    echo "==> seeded $INSTALL_CONFIG_DIR/omni-mcp.toml"
+else
+    echo "==> kept existing $INSTALL_CONFIG_DIR/omni-mcp.toml"
+fi
+
+"$INSTALL_BIN_DIR/omni-mcp" --config "$INSTALL_CONFIG_DIR/omni-mcp.toml" check
+
+case ":$PATH:" in
+    *":$INSTALL_BIN_DIR:"*) ;;
+    *) echo "note: $INSTALL_BIN_DIR is not on your PATH" ;;
+esac
+
+echo "==> done"

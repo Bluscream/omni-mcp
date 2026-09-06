@@ -1,15 +1,32 @@
-version: "3.8"
-
 services:
   omni-mcp:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: omni-mcp:latest
     container_name: omni-mcp
     restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - ../omni-mcp.toml:/app/omni-mcp.toml:ro
+
     environment:
-      - OMNI_MCP_CONFIG=/app/omni-mcp.toml
+      # Required: HTTP mode refuses to start without a token.
+      #   export OMNI_MCP_TOKEN="$(head -c 32 /dev/urandom | base64)"
+      OMNI_MCP_TOKEN: ${OMNI_MCP_TOKEN:?set OMNI_MCP_TOKEN before starting}
+      RUST_LOG: ${RUST_LOG:-info}
+
+    ports:
+      # Bound to loopback: this endpoint drives tools, do not publish it.
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      - ../omni-mcp.toml:/etc/omni-mcp/omni-mcp.toml:ro
+      # Mount whatever the filesystem tools should reach, and list the same
+      # paths under tools.allowed_roots.
+      # - /srv/projects:/srv/projects
+
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

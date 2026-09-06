@@ -1,28 +1,63 @@
-# Unraid Setup Guide for omni-mcp
+# Running omni-mcp on Unraid
 
-This directory contains the template and instructions to deploy **`omni-mcp`** on your Unraid NAS.
+## Before you start
 
-## One-Click Template Installation
+This container exposes tools that read and, if you enable it, write files. It is
+not a public service. Keep it on a trusted network, give it a token, and mount
+only the paths it needs.
 
-1. Copy [`my-omni-mcp.xml`](file:///run/media/system/Data/Projects/MCPs/omni-mcp/unraid/my-omni-mcp.xml) to your Unraid flash drive at:
-   `/boot/config/plugins/dockerMan/templates-user/my-omni-mcp.xml`
-2. Open the **Docker** tab in Unraid web UI and click **Add Container**.
-3. Select **omni-mcp** from the template dropdown.
-4. Mount your configuration file at `/mnt/user/appdata/omni-mcp/omni-mcp.toml`.
-5. Click **Apply**.
+Generate a token:
 
----
+```bash
+head -c 32 /dev/urandom | base64
+```
 
-## Connecting IDEs to Unraid `omni-mcp`
+The container refuses to start in HTTP mode without one.
 
-Point your AI IDE (Antigravity IDE, Claude Desktop, VSCodium) to your Unraid NAS IP:
+## Install
+
+1. Copy `my-omni-mcp.xml` to your Unraid flash drive at
+   `/boot/config/plugins/dockerMan/templates-user/my-omni-mcp.xml`.
+2. **Docker → Add Container**, then pick **omni-mcp** from the template list.
+3. Put your `omni-mcp.toml` at `/mnt/user/appdata/omni-mcp/omni-mcp.toml`.
+4. Paste the token into **Auth Token**.
+5. **Apply**.
+
+Check it came up:
+
+```bash
+curl -s http://<UNRAID_IP>:8080/health
+```
+
+## Connect an IDE
 
 ```json
 {
   "mcpServers": {
     "omni-mcp": {
-      "url": "http://<UNRAID_IP>:8080/mcp"
+      "url": "http://<UNRAID_IP>:8080/mcp",
+      "headers": { "Authorization": "Bearer <YOUR_TOKEN>" }
     }
   }
 }
 ```
+
+## Enabling the filesystem tools
+
+By default nothing can be modified. To allow it, mount a workspace and confine
+the tools to it in `omni-mcp.toml`:
+
+```toml
+[tools]
+allow_file_mutation = true
+allowed_roots = ["/workspace"]
+```
+
+Leave `allow_code_execution` off unless you specifically need `eval_code`, and
+understand that it runs arbitrary commands inside the container.
+
+## Troubleshooting
+
+Call the `omni_status` tool — it reports every backend's health and the reason
+for any discovery failure. For startup problems, check the container log; all
+diagnostics go to stderr.

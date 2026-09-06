@@ -1,3 +1,7 @@
-# Clippy settings for omni-mcp
-# Function length limit: 100 lines max per function
-too-many-lines-threshold = 100
+# Functions longer than this are a sign a responsibility should be extracted.
+too-many-lines-threshold = 80
+
+# `unwrap`/`expect` are denied in `src/`, but tests legitimately assert with them.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

@@ -4,3 +4,8 @@
 .idea/
 .vscode/
 *.log
+
+# Local configuration and anything holding credentials.
+/omni-mcp.local.toml
+.env
+.env.*

@@ -1,0 +1,6 @@
+edition = "2024"
+max_width = 100
+# Keeps short struct literals, calls and match arms on one line, which suits the
+# many small config/JSON constructions in this codebase.
+use_small_heuristics = "Max"
+newline_style = "Unix"

@@ -9,19 +9,46 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/Bluscream/omni-mcp/issues</Support>
   <Project>https://github.com/Bluscream/omni-mcp</Project>
-  <Overview>High-performance, consolidated Model Context Protocol (MCP) router and native Rust module server. Provides instant, sub-millisecond execution and proxy capabilities for AI IDEs like Antigravity IDE and Claude Desktop.</Overview>
+  <Overview>
+    Consolidated Model Context Protocol (MCP) gateway. Serves native Rust tools,
+    supervises local MCP servers and proxies remote ones behind a single HTTP
+    endpoint, so AI IDEs need one connection instead of a dozen processes.
+
+    SECURITY: this endpoint drives tools that read and write files. It requires
+    a bearer token (OMNI_MCP_TOKEN) and should stay on a trusted network. Code
+    execution and file mutation are disabled unless enabled in omni-mcp.toml.
+  </Overview>
   <Category>Tools: System: Status:Stable</Category>
-  <WebUI>http://[IP]:[PORT:8080]/mcp</WebUI>
+  <WebUI>http://[IP]:[PORT:8080]/health</WebUI>
   <TemplateURL/>
   <Icon>https://raw.githubusercontent.com/Bluscream/omni-mcp/main/icon.png</Icon>
-  <ExtraParams/>
+  <ExtraParams>--security-opt no-new-privileges:true --cap-drop ALL</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DateInstalled/>
   <DonateText/>
   <DonateLink/>
   <Requires/>
-  <Config Name="HTTP MCP Port" Target="8080" Default="8080" Mode="tcp" Description="HTTP/SSE MCP Port for IDE connections" Type="Port" Display="always" Required="true" Mask="false">8080</Config>
-  <Config Name="Config Path" Target="/app/omni-mcp.toml" Default="/mnt/user/appdata/omni-mcp/omni-mcp.toml" Mode="ro" Description="Path to omni-mcp.toml configuration file" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/omni-mcp/omni-mcp.toml</Config>
-  <Config Name="OMNI_MCP_CONFIG" Target="OMNI_MCP_CONFIG" Default="/app/omni-mcp.toml" Description="Environment variable pointing to config file" Type="Variable" Display="advanced" Required="true" Mask="false">/app/omni-mcp.toml</Config>
+
+  <Config Name="HTTP MCP Port" Target="8080" Default="8080" Mode="tcp"
+          Description="HTTP MCP port for IDE connections."
+          Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+
+  <Config Name="Config File" Target="/etc/omni-mcp/omni-mcp.toml"
+          Default="/mnt/user/appdata/omni-mcp/omni-mcp.toml" Mode="ro"
+          Description="Path to omni-mcp.toml on the host."
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/omni-mcp/omni-mcp.toml</Config>
+
+  <Config Name="Auth Token" Target="OMNI_MCP_TOKEN" Default=""
+          Description="REQUIRED. Bearer token clients must present. Generate one with: head -c 32 /dev/urandom | base64"
+          Type="Variable" Display="always" Required="true" Mask="true"/>
+
+  <Config Name="Workspace" Target="/workspace"
+          Default="/mnt/user/appdata/omni-mcp/workspace" Mode="rw"
+          Description="Optional. Files the filesystem tools may reach. List the same path under tools.allowed_roots."
+          Type="Path" Display="always" Required="false" Mask="false"/>
+
+  <Config Name="Log Level" Target="RUST_LOG" Default="info"
+          Description="Log verbosity: error, warn, info, debug, trace."
+          Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
 </Container>

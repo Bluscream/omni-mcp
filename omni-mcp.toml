@@ -1,33 +1,84 @@
-# omni-mcp Configuration
-# High-performance consolidated MCP gateway
+# omni-mcp configuration
+#
+# Secrets are never written here. `${VAR}` is expanded from the environment at
+# load time, and `${VAR:-default}` supplies a fallback. A referenced variable
+# that is not set is a startup error rather than a silently empty credential.
 
 [server]
 host = "127.0.0.1"
 port = 8080
 
-# -------------------------------------------------------------------
-# HTTP / SSE Remote Proxies (Pass-through to external MCP endpoints)
-# -------------------------------------------------------------------
-[[proxies]]
-name = "omniroute"
-url = "http://192.168.2.11:20128/api/mcp/sse"
-token = "${OMNIROUTE_TOKEN}"
+# Required by `omni-mcp serve` unless you pass --allow-unauthenticated.
+# This endpoint can run code and modify files; treat the token as a password.
+#   export OMNI_MCP_TOKEN="$(head -c 32 /dev/urandom | base64)"
+auth_token = "${OMNI_MCP_TOKEN:-}"
 
-[[proxies]]
-name = "homeassistant"
-url = "http://192.168.2.4:8123/api/mcp"
-bearer = "${HOME_ASSISTANT_TOKEN}"
+# Browser origins permitted to call /mcp. Empty means CORS is closed, which is
+# correct for a local IDE gateway.
+allowed_origins = []
 
-[[proxies]]
-name = "vrcosc"
-url = "http://127.0.0.1:11370/mcp"
+# -----------------------------------------------------------------------------
+# Capabilities
+#
+# Off by default. Turning these on grants any MCP client — and anything that can
+# reach the HTTP port — the ability to run commands and rewrite files as this
+# user. Enable deliberately, and constrain `allowed_roots` when you do.
+# -----------------------------------------------------------------------------
+[tools]
+allow_code_execution = false
+allow_file_mutation = false
 
-# -------------------------------------------------------------------
-# Subprocess Sidecars (Local Node / Python / Binary MCP workers)
-# -------------------------------------------------------------------
-# Easily add any new MCP server below:
+# Confine the filesystem tools. Empty means unrestricted.
+# allowed_roots = ["/run/media/system/Data/Projects"]
+
+max_file_bytes = 67108864
+
+# -----------------------------------------------------------------------------
+# Limits
+#
+# `max_concurrent_spawns = 1` is the safeguard against the September 2026
+# incident: many MCP servers launching at once through container wrappers put
+# >50 processes into uninterruptible sleep and drove load average past 68.
+# Raise it only if you understand that trade-off.
+# -----------------------------------------------------------------------------
+[limits]
+default_tool_timeout = "30s"
+max_tool_timeout = "300s"
+discovery_timeout = "2500ms"
+discovery_ttl = "60s"
+max_concurrent_calls = 16
+max_concurrent_spawns = 1
+
+# -----------------------------------------------------------------------------
+# Remote MCP servers over HTTP
+# -----------------------------------------------------------------------------
+# [[proxies]]
+# name = "homeassistant"
+# url = "${HOME_ASSISTANT_URL:-http://homeassistant.local:8123/api/mcp}"
+# bearer = "${HOME_ASSISTANT_TOKEN}"
+# prefix = "ha_"          # keeps its tool names from colliding with others
+# timeout = "30s"
+
+# [[proxies]]
+# name = "omniroute"
+# url = "${OMNIROUTE_URL}"
+# bearer = "${OMNIROUTE_TOKEN}"
+
+# [[proxies]]
+# name = "vrcosc"
+# url = "http://127.0.0.1:11370/mcp"
+
+# -----------------------------------------------------------------------------
+# Local MCP servers run as child processes
+#
+# Run these natively rather than through `distrobox enter` / `podman`: the
+# per-call container wrapper is what produced the OverlayFS lock contention.
+# `lazy = true` means the process starts on first use, not at IDE startup.
+# -----------------------------------------------------------------------------
 # [[sidecars]]
 # name = "browser-control"
 # command = "node"
-# args = ["/run/media/system/Data/Projects/MCPs/browser-control-mcp/mcp-server/dist/server.js"]
+# args = ["/path/to/browser-control-mcp/mcp-server/dist/server.js"]
 # lazy = true
+# prefix = "browser_"
+# startup_timeout = "20s"

@@ -1,121 +1,185 @@
-use axum::{
-    extract::State,
-    routing::post,
-    Json, Router,
-};
-use std::env;
-use std::fs;
-use std::io::{self, BufRead};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
 
-mod config;
-mod modules;
-mod registry;
-mod traits;
-mod types;
+use clap::Parser;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
-use config::Config;
-use modules::common::CommonModule;
-use modules::diff::DiffModule;
-use modules::eval::EvalModule;
-use modules::everything::EverythingModule;
-use modules::grep::GrepModule;
-use modules::hex::HexModule;
-use modules::resx::ResxModule;
-use registry::Registry;
-use types::{JsonRpcRequest, JsonRpcResponse};
+use omni_mcp::cli::{Cli, Command};
+use omni_mcp::config::Config;
+use omni_mcp::error::StartupError;
+use omni_mcp::router::Router;
+use omni_mcp::server::{HttpConfig, http, stdio};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_writer(io::stderr)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
+async fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    init_logging(cli.log.as_deref());
 
-    info!("Starting omni-mcp daemon...");
+    match run(&cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            // stderr, never stdout: stdout is the JSON-RPC stream.
+            eprintln!("omni-mcp: {err}");
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                eprintln!("  caused by: {cause}");
+                source = cause.source();
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
-    // Load configuration if present
-    let config_path = env::var("OMNI_MCP_CONFIG").unwrap_or_else(|_| "omni-mcp.toml".to_string());
-    let config = if let Ok(contents) = fs::read_to_string(&config_path) {
-        info!("Loaded configuration from {}", config_path);
-        toml::from_str::<Config>(&contents).unwrap_or_default()
-    } else {
-        info!("No config file found at {}, using default config", config_path);
-        Config::default()
+/// Logs go to stderr. Writing them to stdout corrupts the stdio transport,
+/// which is how the original build produced unparseable frames.
+fn init_logging(level: Option<&str>) {
+    let filter = level.map_or_else(
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        EnvFilter::new,
+    );
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
+}
+
+async fn run(cli: &Cli) -> Result<(), StartupError> {
+    let path = cli.config_path();
+    let config = Config::load_or_default(&path)?;
+    info!(config = %path.display(), "configuration loaded");
+
+    match cli.command() {
+        Command::Check => check(&path, &config),
+        Command::Tools { json } => list_tools(config, *json).await,
+        Command::Stdio => {
+            let router = build(config).await?;
+            stdio::serve(router).await.map_err(StartupError::Io)
+        }
+        Command::Serve { bind, allow_unauthenticated } => {
+            serve_http(config, bind.as_deref(), *allow_unauthenticated).await
+        }
+    }
+}
+
+async fn build(config: Config) -> Result<Arc<Router>, StartupError> {
+    let router = Router::build(config).map_err(|err| {
+        StartupError::Config(omni_mcp::error::ConfigError::Invalid(err.to_string()))
+    })?;
+    let router = Arc::new(router);
+    router.warm_up().await;
+    Ok(router)
+}
+
+async fn serve_http(
+    config: Config,
+    bind: Option<&str>,
+    allow_unauthenticated: bool,
+) -> Result<(), StartupError> {
+    // Refuse to expose code execution and file writes without authentication
+    // unless the operator says so explicitly.
+    if config.server.auth_token().is_none() && !allow_unauthenticated {
+        return Err(StartupError::UnauthenticatedHttp);
+    }
+
+    let address = bind
+        .map_or_else(|| format!("{}:{}", config.server.host, config.server.port), str::to_string);
+    let http_config = HttpConfig {
+        token: config.server.auth_token().map(str::to_string),
+        allowed_origins: config.server.allowed_origins.clone(),
+        max_body_bytes: config.server.max_body_bytes,
     };
 
-    // Initialize Registry & Register Native Modules
-    let mut registry = Registry::new(config.clone());
-    registry.register(DiffModule::new());
-    registry.register(CommonModule::new());
-    registry.register(ResxModule::new());
-    registry.register(EverythingModule::new());
-    registry.register(EvalModule::new());
-    registry.register(GrepModule::new());
-    registry.register(HexModule::new());
+    let router = build(config).await?;
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .map_err(|source| StartupError::Bind { addr: address.clone(), source })?;
 
-    let shared_registry = Arc::new(registry);
+    http::serve(listener, router, &http_config).await.map_err(StartupError::Io)
+}
 
-    // Check CLI flags
-    let args: Vec<String> = env::args().collect();
-    if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
-        println!("omni-mcp - High-performance consolidated MCP router in Rust");
-        println!("Usage: omni-mcp [--stdio|--help|--version]");
-        return Ok(());
-    }
+fn check(path: &std::path::Path, config: &Config) -> Result<(), StartupError> {
+    config.validate()?;
 
-    if args.contains(&"--version".to_string()) || args.contains(&"-v".to_string()) {
-        println!("omni-mcp v{}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
-    if args.contains(&"--stdio".to_string()) {
-        info!("Running in stdio mode...");
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&line) {
-                let has_id = req.id.is_some();
-                let resp = shared_registry.handle_request(req).await;
-                if has_id {
-                    println!("{}", serde_json::to_string(&resp).unwrap_or_default());
-                    let _ = std::io::Write::flush(&mut io::stdout());
-                }
-            }
+    println!("configuration: {}", path.display());
+    println!("  bind:                 {}:{}", config.server.host, config.server.port);
+    println!(
+        "  http auth:            {}",
+        if config.server.auth_token().is_some() { "bearer token set" } else { "NOT SET" }
+    );
+    println!(
+        "  cors origins:         {}",
+        if config.server.allowed_origins.is_empty() {
+            "none (closed)".to_string()
+        } else {
+            config.server.allowed_origins.join(", ")
         }
-        return Ok(());
+    );
+    println!("  code execution:       {}", enabled(config.tools.allow_code_execution));
+    println!("  file mutation:        {}", enabled(config.tools.allow_file_mutation));
+    println!(
+        "  allowed roots:        {}",
+        if config.tools.allowed_roots.is_empty() {
+            "unrestricted".to_string()
+        } else {
+            config
+                .tools
+                .allowed_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    println!("  max concurrent calls: {}", config.limits.max_concurrent_calls);
+    println!("  max concurrent spawns:{}", config.limits.max_concurrent_spawns);
+
+    println!("  sidecars:");
+    for sidecar in &config.sidecars {
+        println!(
+            "    - {:<20} {} {} ({})",
+            sidecar.name,
+            sidecar.command,
+            sidecar.args.join(" "),
+            if sidecar.enabled { if sidecar.lazy { "lazy" } else { "eager" } } else { "disabled" }
+        );
+    }
+    println!("  proxies:");
+    for proxy in &config.proxies {
+        println!(
+            "    - {:<20} {} ({}{})",
+            proxy.name,
+            proxy.url,
+            if proxy.enabled { "enabled" } else { "disabled" },
+            if proxy.bearer.is_some() { ", authenticated" } else { "" }
+        );
     }
 
-    // HTTP / SSE Server Mode
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    info!("Binding HTTP MCP server to http://{}", addr);
-
-    let app = Router::new()
-        .route("/mcp", post(handle_mcp))
-        .layer(CorsLayer::permissive())
-        .with_state(shared_registry);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
+    println!("\nconfiguration is valid.");
     Ok(())
 }
 
-async fn handle_mcp(
-    State(registry): State<Arc<Registry>>,
-    Json(req): Json<JsonRpcRequest>,
-) -> Json<JsonRpcResponse> {
-    let resp = registry.handle_request(req).await;
-    Json(resp)
+fn enabled(flag: bool) -> &'static str {
+    if flag { "enabled" } else { "disabled" }
+}
+
+async fn list_tools(config: Config, as_json: bool) -> Result<(), StartupError> {
+    let router = build(config).await?;
+    let tools = router.list_tools().await;
+
+    if as_json {
+        let rendered = serde_json::to_string_pretty(&tools)
+            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    println!("{} tools available:\n", tools.len());
+    for tool in tools {
+        let description = tool.description.unwrap_or_default();
+        let summary = description.lines().next().unwrap_or_default();
+        println!("  {:<24} {summary}", tool.name);
+    }
+    Ok(())
 }
