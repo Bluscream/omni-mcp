@@ -25,6 +25,8 @@ pub struct Config {
     pub proxies: Vec<ProxyConfig>,
     #[serde(default)]
     pub sidecars: Vec<SidecarConfig>,
+    #[serde(default)]
+    pub ssh: Vec<SshServerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -149,6 +151,9 @@ pub struct ToolPolicy {
     /// Enables `eval_code` (runs arbitrary python/node/bash/... snippets).
     #[serde(default)]
     pub allow_code_execution: bool,
+    /// Enables SSH and SFTP tools (`ssh_execute`, `ssh_upload`, `ssh_download`, `ssh_list_servers`).
+    #[serde(default)]
+    pub allow_ssh: bool,
     /// Allows `grep_search` to rewrite files and `hex_patch` to modify binaries.
     #[serde(default)]
     pub allow_file_mutation: bool,
@@ -168,11 +173,50 @@ impl Default for ToolPolicy {
     fn default() -> Self {
         Self {
             allow_code_execution: false,
+            allow_ssh: false,
             allow_file_mutation: false,
             allowed_roots: Vec::new(),
             max_file_bytes: default_max_file_bytes(),
         }
     }
+}
+
+/// A configured remote SSH server profile.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshServerConfig {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub user: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<PathBuf>,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+    /// Optional pinned host key fingerprint (SHA256).
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// Optional SOCKS5 proxy e.g. `<socks5://127.0.0.1:1080>`.
+    #[serde(default)]
+    pub socks_proxy: Option<String>,
+    /// Command regex whitelist (if non-empty, commands must match).
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    /// Command regex blacklist (commands must not match).
+    #[serde(default)]
+    pub blacklist: Vec<String>,
+    /// If true, local paths for upload/download bypass `tools.allowed_roots`.
+    #[serde(default)]
+    pub bypass_allowed_roots: bool,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+const fn default_ssh_port() -> u16 {
+    22
 }
 
 /// A remote MCP server reached over HTTP.
@@ -316,6 +360,22 @@ impl Config {
             }
         }
 
+        let mut ssh_seen = std::collections::HashSet::new();
+        for s in &self.ssh {
+            if s.name.trim().is_empty() {
+                return invalid("ssh server names must not be empty".into());
+            }
+            if !ssh_seen.insert(&s.name) {
+                return invalid(format!("duplicate ssh server name {:?}", s.name));
+            }
+            if s.host.trim().is_empty() {
+                return invalid(format!("ssh server {:?} has an empty host", s.name));
+            }
+            if s.user.trim().is_empty() {
+                return invalid(format!("ssh server {:?} has an empty user", s.name));
+            }
+        }
+
         Ok(())
     }
 
@@ -325,6 +385,10 @@ impl Config {
 
     pub fn enabled_sidecars(&self) -> impl Iterator<Item = &SidecarConfig> {
         self.sidecars.iter().filter(|s| s.enabled)
+    }
+
+    pub fn enabled_ssh(&self) -> impl Iterator<Item = &SshServerConfig> {
+        self.ssh.iter().filter(|s| s.enabled)
     }
 }
 

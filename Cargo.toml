@@ -42,6 +42,10 @@ memchr = "2.7"
 tempfile = "3.14"
 hex = "0.4"
 urlencoding = "2.1"
+russh = "0.63"
+russh-sftp = "2.4"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1.44", features = ["test-util"] }

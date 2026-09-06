@@ -49,6 +49,17 @@ impl ToolContext {
         ))
     }
 
+    /// Fails unless `tools.allow_ssh` is set.
+    pub fn require_ssh(&self) -> ToolResult<()> {
+        if self.policy.allow_ssh {
+            return Ok(());
+        }
+        Err(ToolError::Denied(
+            "ssh access is disabled; set `allow_ssh = true` under [tools] in omni-mcp.toml to enable it"
+                .into(),
+        ))
+    }
+
     /// Fails unless `tools.allow_file_mutation` is set.
     pub fn require_file_mutation(&self) -> ToolResult<()> {
         if self.policy.allow_file_mutation {

@@ -117,6 +117,7 @@ fn check(path: &std::path::Path, config: &Config) -> Result<(), StartupError> {
         }
     );
     println!("  code execution:       {}", enabled(config.tools.allow_code_execution));
+    println!("  ssh:                  {}", enabled(config.tools.allow_ssh));
     println!("  file mutation:        {}", enabled(config.tools.allow_file_mutation));
     println!(
         "  allowed roots:        {}",
@@ -134,6 +135,18 @@ fn check(path: &std::path::Path, config: &Config) -> Result<(), StartupError> {
     );
     println!("  max concurrent calls: {}", config.limits.max_concurrent_calls);
     println!("  max concurrent spawns:{}", config.limits.max_concurrent_spawns);
+
+    println!("  ssh servers:");
+    for s in &config.ssh {
+        println!(
+            "    - {:<20} {}@{}:{} ({})",
+            s.name,
+            s.user,
+            s.host,
+            s.port,
+            if s.enabled { "enabled" } else { "disabled" }
+        );
+    }
 
     println!("  sidecars:");
     for sidecar in &config.sidecars {

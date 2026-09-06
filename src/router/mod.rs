@@ -43,8 +43,10 @@ impl Router {
     pub fn build(config: Config) -> Result<Self, ToolError> {
         let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
 
-        backends
-            .push(Arc::new(NativeBackend::with_defaults(ToolContext::new(config.tools.clone()))));
+        backends.push(Arc::new(NativeBackend::with_ssh(
+            config.ssh.clone(),
+            ToolContext::new(config.tools.clone()),
+        )));
 
         let spawn_permits = Arc::new(Semaphore::new(config.limits.max_concurrent_spawns));
         for sidecar in config.enabled_sidecars() {

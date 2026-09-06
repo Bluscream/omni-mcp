@@ -48,13 +48,18 @@ pub fn u64_or(args: &Value, field: &str, default: u64) -> ToolResult<u64> {
     Ok(opt_u64(args, field)?.unwrap_or(default))
 }
 
-/// Reads an optional boolean, falling back to `default`.
-pub fn bool_or(args: &Value, field: &str, default: bool) -> ToolResult<bool> {
+/// Reads an optional boolean. A JSON `null` is treated as absent.
+pub fn opt_bool(args: &Value, field: &str) -> ToolResult<Option<bool>> {
     match args.get(field) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Bool(b)) => Ok(*b),
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(other) => Err(type_error(field, "boolean", other)),
     }
+}
+
+/// Reads an optional boolean, falling back to `default`.
+pub fn bool_or(args: &Value, field: &str, default: bool) -> ToolResult<bool> {
+    Ok(opt_bool(args, field)?.unwrap_or(default))
 }
 
 fn type_error(field: &str, expected: &str, actual: &Value) -> ToolError {

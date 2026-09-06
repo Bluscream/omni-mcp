@@ -7,11 +7,13 @@ pub mod fs;
 pub mod hex;
 pub mod resx;
 pub mod search;
+pub mod ssh;
 pub mod text;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::config::SshServerConfig;
 use crate::error::{ToolError, ToolResult};
 use crate::protocol::{CallToolResult, Tool};
 pub use context::ToolContext;
@@ -28,6 +30,11 @@ pub trait NativeTool: Send + Sync {
 
 /// Every native tool group, in registration order.
 pub fn all() -> Vec<Box<dyn NativeTool>> {
+    all_with_ssh(Vec::new())
+}
+
+/// Every native tool group including configured SSH server profiles.
+pub fn all_with_ssh(ssh_configs: Vec<SshServerConfig>) -> Vec<Box<dyn NativeTool>> {
     vec![
         Box::new(text::TextTools),
         Box::new(fs::FsTools),
@@ -35,6 +42,7 @@ pub fn all() -> Vec<Box<dyn NativeTool>> {
         Box::new(resx::ResxTools),
         Box::new(search::SearchTools::new()),
         Box::new(eval::EvalTools),
+        Box::new(ssh::SshTools::new(ssh_configs)),
     ]
 }
 

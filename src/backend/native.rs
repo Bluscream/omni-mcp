@@ -40,6 +40,13 @@ impl NativeBackend {
         Self::new(crate::tools::all(), context)
     }
 
+    pub fn with_ssh(
+        ssh_configs: Vec<crate::config::SshServerConfig>,
+        context: ToolContext,
+    ) -> Self {
+        Self::new(crate::tools::all_with_ssh(ssh_configs), context)
+    }
+
     pub fn handles(&self, tool: &str) -> bool {
         self.routes.contains_key(tool)
     }
