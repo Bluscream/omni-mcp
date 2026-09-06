@@ -159,6 +159,9 @@ impl NativeTool for EvalTools {
                     "language": {
                         "type": "string",
                         "description": format!("One of: {}", languages.join(", ")),
+                        // Keep the enum: it lets the client reject a bad
+                        // language before a call is ever dispatched.
+                        "enum": RUNTIMES.iter().flat_map(|r| r.names.iter().copied()).collect::<Vec<_>>(),
                     },
                     "code": {
                         "type": "string",
@@ -210,7 +213,6 @@ async fn evaluate(arguments: &Value) -> ToolResult<CallToolResult> {
 
     let (mut command, backend_name) = build_command(runtime, &script, workspace.path()).await?;
 
-
     command
         .current_dir(workspace.path())
         .stdin(Stdio::piped())
@@ -221,6 +223,13 @@ async fn evaluate(arguments: &Value) -> ToolResult<CallToolResult> {
     // nothing is left behind in the user's home.
     command.env("GOCACHE", workspace.path().join("go-cache"));
     command.env("TMPDIR", workspace.path());
+    // `dotnet` otherwise writes to $HOME/.dotnet and $HOME/.nuget, which
+    // pollutes the user's home and fails outright on a read-only rootfs.
+    command.env("DOTNET_CLI_HOME", workspace.path());
+    command.env("NUGET_PACKAGES", workspace.path().join("nuget"));
+    command.env("DOTNET_NOLOGO", "1");
+    command.env("DOTNET_CLI_TELEMETRY_OPTOUT", "1");
+    command.env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1");
 
     let mut child = command.spawn().map_err(|e| ToolError::Unavailable {
         backend: backend_name,
@@ -436,6 +445,107 @@ mod tests {
         if let Err(err) = outcome {
             assert!(matches!(err, ToolError::Unavailable { .. }), "got {err:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn compiled_languages_run_via_their_fallback_toolchains() {
+        // rust-script / dotnet-script are usually absent, so this exercises the
+        // rustc and `dotnet run` fallbacks that actually get used in practice.
+        for (language, code, expected) in [
+            ("rust", r#"fn main(){println!("ok-rust");}"#, "ok-rust"),
+            ("csharp", r#"System.Console.WriteLine("ok-csharp");"#, "ok-csharp"),
+        ] {
+            let available = match language {
+                "rust" => which("rustc").is_some() || which("rust-script").is_some(),
+                _ => which("dotnet").is_some() || which("dotnet-script").is_some(),
+            };
+            if !available {
+                continue;
+            }
+
+            let outcome = EvalTools
+                .call(
+                    "eval_code",
+                    json!({ "language": language, "code": code, "timeout_seconds": 180 }),
+                    &ctx(true),
+                )
+                .await;
+
+            match outcome {
+                Ok(result) => {
+                    let out = result.structured_content.unwrap();
+                    assert_eq!(
+                        out["exit_code"],
+                        0,
+                        "{language} failed: {}",
+                        out["stderr"].as_str().unwrap_or_default()
+                    );
+                    assert!(
+                        out["stdout"].as_str().unwrap_or_default().contains(expected),
+                        "{language} produced {:?}",
+                        out["stdout"]
+                    );
+                }
+                // A toolchain present but unusable must degrade, never panic.
+                Err(err) => assert!(
+                    matches!(err, ToolError::Unavailable { .. } | ToolError::Timeout { .. }),
+                    "{language}: unexpected {err:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compiler_error_is_reported_rather_than_swallowed() {
+        if which("rustc").is_none() && which("rust-script").is_none() {
+            return;
+        }
+        let result = EvalTools
+            .call(
+                "eval_code",
+                json!({ "language": "rust", "code": "fn main(){ this is not rust }", "timeout_seconds": 120 }),
+                &ctx(true),
+            )
+            .await;
+
+        if let Ok(result) = result {
+            assert!(result.is_failure(), "a compile failure must be flagged");
+            let out = result.structured_content.unwrap();
+            assert_ne!(out["exit_code"], 0);
+        }
+    }
+
+    #[test]
+    fn the_advertised_schema_constrains_language_to_known_names() {
+        let tool = &EvalTools.descriptors()[0];
+        let names: Vec<&str> = tool.input_schema["properties"]["language"]["enum"]
+            .as_array()
+            .expect("language must be an enum so bad values are rejected up front")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        for expected in ["python", "sh", "rust", "csharp"] {
+            assert!(names.contains(&expected), "{expected} missing from the enum");
+        }
+    }
+
+    #[test]
+    fn every_runtime_alias_is_reachable_through_lookup() {
+        for runtime in RUNTIMES {
+            for alias in runtime.names {
+                assert!(lookup(alias).is_ok(), "alias {alias} does not resolve");
+            }
+        }
+    }
+
+    /// Minimal PATH lookup for test gating.
+    fn which(program: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(program))
+                .find(|candidate| candidate.is_file())
+        })
     }
 
     #[test]
