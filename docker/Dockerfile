@@ -37,11 +37,15 @@ RUN apt-get update \
 
 # Never run the gateway as root: its tools touch the filesystem.
 RUN useradd --system --create-home --uid 10001 omni
+
+# No --chown, which is what we want: COPY defaults to root:root and preserves
+# the source mode, so `omni` can read and execute these but never rewrite its
+# own binary or configuration.
+COPY --from=builder /src/target/release/omni-mcp /usr/local/bin/omni-mcp
+COPY omni-mcp.toml /etc/omni-mcp/omni-mcp.toml
+
 USER omni
 WORKDIR /home/omni
-
-COPY --from=builder --chown=omni:omni /src/target/release/omni-mcp /usr/local/bin/omni-mcp
-COPY --chown=omni:omni omni-mcp.toml /etc/omni-mcp/omni-mcp.toml
 
 ENV OMNI_MCP_CONFIG=/etc/omni-mcp/omni-mcp.toml \
     RUST_LOG=info
