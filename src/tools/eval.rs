@@ -306,9 +306,32 @@ async fn evaluate(arguments: &Value) -> ToolResult<CallToolResult> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // `go run` compiles into a cache; keep that inside the scratch directory so
-    // nothing is left behind in the user's home.
+    // Point the toolchains' state at the scratch directory.
+    //
+    // Nearly every runtime here keeps a cache somewhere under $HOME — deno,
+    // bun, java, julia, elixir, kotlin, scala, dart, haskell, swift and zig all
+    // do. Redirecting HOME and the XDG directories covers them in one move
+    // rather than chasing a bespoke variable per language, and it is what makes
+    // eval_code usable under the container's read-only rootfs.
+    // HOME is deliberately left alone. On this host several interpreters are
+    // distrobox-exported wrapper scripts that resolve their container through
+    // $HOME, so overriding it makes `node` fail with `no such container`.
+    // XDG_CONFIG_HOME is likewise untouched: tools read their config from it.
+    // Only XDG_CACHE_HOME is safe to redirect here. HOME and XDG_DATA_HOME are
+    // deliberately left alone: several interpreters on this host are
+    // distrobox-exported wrappers, and rootless podman keeps its container
+    // storage under $XDG_DATA_HOME/containers — redirecting either makes the
+    // wrapper fail with `no such container`.
+    let sandbox = workspace.path();
+    command.env("XDG_CACHE_HOME", sandbox.join("cache"));
+
+    // A few toolchains ignore HOME/XDG and need naming directly.
     command.env("GOCACHE", workspace.path().join("go-cache"));
+    command.env("GOMODCACHE", workspace.path().join("go-mod"));
+    command.env("DENO_DIR", workspace.path().join("deno"));
+    command.env("JULIA_DEPOT_PATH", workspace.path().join("julia"));
+    command.env("PUB_CACHE", workspace.path().join("pub"));
+    command.env("COURSIER_CACHE", workspace.path().join("coursier"));
     command.env("TMPDIR", workspace.path());
     // `dotnet` otherwise writes to $HOME/.dotnet and $HOME/.nuget, which
     // pollutes the user's home and fails outright on a read-only rootfs.
