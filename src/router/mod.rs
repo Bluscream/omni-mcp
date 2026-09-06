@@ -4,10 +4,11 @@ pub mod routes;
 pub mod status;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{debug, warn};
 
 use crate::backend::{
@@ -26,6 +27,14 @@ pub struct Router {
     /// Bounds how many tool calls run at once, so a client that fires twenty
     /// parallel calls cannot spawn twenty subprocess trees.
     call_permits: Semaphore,
+    /// Serialises discovery. Without it, every caller that arrives after the
+    /// TTL expires starts its own full sweep of every backend — a stampede of
+    /// redundant round trips against exactly the endpoints we are trying not
+    /// to overload.
+    discovery_lock: Mutex<()>,
+    /// How many discovery sweeps have run. Reported by `omni_status`, and the
+    /// signal that coalescing actually works.
+    discoveries: AtomicU64,
 }
 
 impl Router {
@@ -53,7 +62,14 @@ impl Router {
         }
 
         let call_permits = Semaphore::new(config.limits.max_concurrent_calls);
-        Ok(Self { backends, routes: RwLock::new(None), config, call_permits })
+        Ok(Self {
+            backends,
+            routes: RwLock::new(None),
+            config,
+            call_permits,
+            discovery_lock: Mutex::new(()),
+            discoveries: AtomicU64::new(0),
+        })
     }
 
     /// Eagerly starts non-lazy sidecars and warms the routing table.
@@ -169,22 +185,47 @@ impl Router {
         Some((routes.owner(name)?, routes.was_augmented(name)))
     }
 
+    /// Rediscovers only if the table is missing or past its TTL.
+    ///
+    /// Callers that pile up behind the lock re-check staleness once they hold
+    /// it, so the first one through refreshes and the rest simply use its
+    /// result.
     async fn ensure_fresh(&self) {
-        let stale = {
-            let guard = self.routes.read().await;
-            guard
-                .as_ref()
-                .is_none_or(|routes| routes.is_stale(self.config.limits.discovery_ttl.get()))
-        };
-        if stale {
-            self.refresh().await;
+        if !self.is_stale().await {
+            return;
         }
+        let _guard = self.discovery_lock.lock().await;
+        if !self.is_stale().await {
+            return;
+        }
+        self.discover_now().await;
     }
 
+    async fn is_stale(&self) -> bool {
+        self.routes
+            .read()
+            .await
+            .as_ref()
+            .is_none_or(|routes| routes.is_stale(self.config.limits.discovery_ttl.get()))
+    }
+
+    /// Forces a rediscovery, still serialised against concurrent sweeps.
     pub async fn refresh(&self) {
+        let _guard = self.discovery_lock.lock().await;
+        self.discover_now().await;
+    }
+
+    /// Performs one sweep. The caller must hold `discovery_lock`.
+    async fn discover_now(&self) {
+        self.discoveries.fetch_add(1, Ordering::Relaxed);
         let discovered =
             Routes::discover(&self.backends, self.config.limits.discovery_timeout.get()).await;
         *self.routes.write().await = Some(discovered);
+    }
+
+    /// Number of discovery sweeps performed so far.
+    pub fn discovery_count(&self) -> u64 {
+        self.discoveries.load(Ordering::Relaxed)
     }
 
     async fn status_report(&self) -> CallToolResult {
@@ -198,7 +239,7 @@ impl Router {
 
         let mut all = vec![status::descriptor()];
         all.extend(tools);
-        status::report(&self.backends, &all, &failures).await
+        status::report(&self.backends, &all, &failures, self.discovery_count()).await
     }
 
     /// Chooses the deadline for a call: the caller's `timeout`/`timeout_ms`

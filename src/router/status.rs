@@ -27,6 +27,7 @@ pub async fn report(
     backends: &[Arc<dyn Backend>],
     tools: &[Tool],
     failures: &[(String, String)],
+    discoveries: u64,
 ) -> CallToolResult {
     let mut entries = Vec::new();
 
@@ -57,7 +58,8 @@ pub async fn report(
         "tool_count": names.len(),
         "tools": names,
         "backends": entries,
-        "unhealthy_backends": failures.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        "unhealthy_backends": failures.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "discovery_sweeps": discoveries
     }))
 }
 
@@ -123,7 +125,7 @@ mod tests {
             Arc::new(Stub("ha", BackendKind::Proxy, BackendStatus::Failed("refused".into()))),
         ];
 
-        let result = report(&backends, &tools(), &[("ha".into(), "refused".into())]).await;
+        let result = report(&backends, &tools(), &[("ha".into(), "refused".into())], 3).await;
         let out = result.structured_content.unwrap();
 
         assert_eq!(out["tool_count"], 2);
@@ -131,13 +133,14 @@ mod tests {
         assert_eq!(out["backends"][1]["status"], "failed");
         assert_eq!(out["backends"][1]["discovery_error"], "refused");
         assert_eq!(out["unhealthy_backends"], json!(["ha"]));
+        assert_eq!(out["discovery_sweeps"], 3);
     }
 
     #[tokio::test]
     async fn an_idle_lazy_backend_is_reported_as_idle_not_failed() {
         let backends: Vec<Arc<dyn Backend>> =
             vec![Arc::new(Stub("side", BackendKind::Sidecar, BackendStatus::Idle))];
-        let out = report(&backends, &tools(), &[]).await.structured_content.unwrap();
+        let out = report(&backends, &tools(), &[], 1).await.structured_content.unwrap();
         assert_eq!(out["backends"][0]["status"], "idle");
         assert_eq!(out["unhealthy_backends"], json!([]));
     }
@@ -146,7 +149,7 @@ mod tests {
     async fn the_report_is_not_flagged_as_an_error_even_when_backends_are_down() {
         let backends: Vec<Arc<dyn Backend>> =
             vec![Arc::new(Stub("x", BackendKind::Proxy, BackendStatus::Failed("no".into())))];
-        let result = report(&backends, &tools(), &[]).await;
+        let result = report(&backends, &tools(), &[], 1).await;
         assert!(!result.is_failure());
     }
 

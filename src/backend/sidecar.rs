@@ -50,12 +50,15 @@ struct Connection {
 }
 
 impl Connection {
-    fn fail_all(&self) {
+    /// Marks the connection dead and wakes every in-flight caller.
+    ///
+    /// This must not be a `try_lock`: if the lock happened to be contended, the
+    /// pending senders stayed alive and their callers waited out the full tool
+    /// timeout instead of learning immediately that the process had exited.
+    async fn fail_all(&self) {
         self.alive.store(false, Ordering::SeqCst);
         // Dropping the senders wakes every waiter with a receive error.
-        if let Ok(mut pending) = self.pending.try_lock() {
-            pending.clear();
-        }
+        self.pending.lock().await.clear();
     }
 }
 
@@ -195,7 +198,7 @@ async fn request(
     let envelope = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     if let Err(err) = write_line(connection, &envelope).await {
         connection.pending.lock().await.remove(&id);
-        connection.fail_all();
+        connection.fail_all().await;
         return Err(err);
     }
 
@@ -269,7 +272,7 @@ where
 
     if let Some(connection) = connection.upgrade() {
         info!(sidecar = %name, "sidecar closed its output stream");
-        connection.fail_all();
+        connection.fail_all().await;
     }
 }
 
@@ -466,6 +469,70 @@ mod tests {
         assert!(backend.list_tools(Duration::from_secs(5)).await.is_err());
         // A second attempt must not hang or reuse the dead connection.
         assert!(backend.list_tools(Duration::from_secs(5)).await.is_err());
+    }
+
+    /// Answers `initialize`, then exits without replying to anything else.
+    fn dies_mid_request() -> SidecarConfig {
+        config(
+            "sh",
+            &[
+                "-c",
+                r#"
+                while IFS= read -r line; do
+                  case "$line" in
+                    *'"initialize"'*)
+                      id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+                      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}" ;;
+                    *'"tools/'*)
+                      # Die with the request in flight, answering nothing.
+                      exit 0 ;;
+                  esac
+                done
+                "#,
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_caller_waiting_on_a_process_that_exits_fails_immediately() {
+        // `fail_all` used to drop the pending senders only if it could grab the
+        // lock without waiting; when it could not, the caller sat here until the
+        // full tool timeout elapsed instead of being told the process had died.
+        let backend = backend(dies_mid_request());
+
+        let started = std::time::Instant::now();
+        let err = backend.list_tools(Duration::from_secs(30)).await.unwrap_err();
+
+        assert!(!matches!(err, ToolError::Timeout { .. }), "waited out the deadline: {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}; should fail as soon as stdout closes",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_concurrent_caller_is_woken_when_the_process_dies() {
+        // No restart, so this measures the wake-up path rather than the cost of
+        // respawning a process that dies again on every attempt.
+        let mut cfg = dies_mid_request();
+        cfg.restart_on_failure = false;
+        let backend = Arc::new(backend(cfg));
+
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let backend = Arc::clone(&backend);
+                tokio::spawn(async move {
+                    backend.call("anything", json!({}), Duration::from_secs(30)).await
+                })
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        for handle in callers {
+            assert!(handle.await.unwrap().is_err());
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "some callers hung");
     }
 
     #[tokio::test]

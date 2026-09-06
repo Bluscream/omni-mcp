@@ -310,3 +310,73 @@ async fn concurrent_calls_all_complete_under_the_concurrency_limit() {
         assert!(handle.await.unwrap().is_ok());
     }
 }
+
+#[tokio::test]
+async fn concurrent_callers_share_one_discovery_sweep() {
+    // Past the TTL, every arriving caller used to start its own full sweep of
+    // every backend — a stampede against the endpoints we are trying not to
+    // overload. They must coalesce onto one.
+    let config = Config {
+        limits: Limits { discovery_ttl: HumanDuration::secs(300), ..Default::default() },
+        ..Default::default()
+    };
+    let router = Arc::new(router(config));
+    assert_eq!(router.discovery_count(), 0);
+
+    let callers: Vec<_> = (0..16)
+        .map(|_| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move { router.list_tools().await.len() })
+        })
+        .collect();
+
+    for handle in callers {
+        assert!(handle.await.unwrap() > 5);
+    }
+    assert_eq!(router.discovery_count(), 1, "discovery was not coalesced");
+}
+
+#[tokio::test]
+async fn an_expired_table_is_rediscovered_exactly_once() {
+    let config = Config {
+        limits: Limits { discovery_ttl: HumanDuration::millis(60), ..Default::default() },
+        ..Default::default()
+    };
+    let router = Arc::new(router(config));
+
+    router.list_tools().await;
+    assert_eq!(router.discovery_count(), 1);
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let callers: Vec<_> = (0..8)
+        .map(|_| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move { router.list_tools().await })
+        })
+        .collect();
+    for handle in callers {
+        handle.await.unwrap();
+    }
+
+    assert_eq!(router.discovery_count(), 2, "the expired table was swept more than once");
+}
+
+#[tokio::test]
+async fn a_fresh_table_is_not_rediscovered() {
+    let router = router(Config::default());
+    router.list_tools().await;
+    router.list_tools().await;
+    router.list_tools().await;
+    assert_eq!(router.discovery_count(), 1);
+}
+
+#[tokio::test]
+async fn omni_status_reports_how_many_sweeps_have_run() {
+    let router = router(Config::default());
+    let response = call(&router, "omni_status", json!({})).await;
+    let report: Value =
+        serde_json::from_str(response.result.unwrap()["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(report["discovery_sweeps"], 1);
+}
