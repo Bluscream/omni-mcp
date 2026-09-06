@@ -23,6 +23,15 @@ services:
       # paths under tools.allowed_roots.
       # - /srv/projects:/srv/projects
 
+    # Defined here rather than in the Dockerfile: HEALTHCHECK is a Docker-format
+    # extension that OCI images ignore.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/omni-mcp", "--config", "/etc/omni-mcp/omni-mcp.toml", "check"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
     read_only: true
     tmpfs:
       - /tmp

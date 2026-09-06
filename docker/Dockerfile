@@ -26,17 +26,22 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 # ------------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
-# `eval_code` is disabled by default; these interpreters are only useful if the
-# operator enables it. Drop this layer for a smaller, more locked-down image.
+# `eval_code` is disabled by default, so the interpreters it would drive are not
+# installed by default either. Enable them only if you intend to turn on
+# tools.allow_code_execution:
+#   podman build --build-arg INCLUDE_INTERPRETERS=true ...
+ARG INCLUDE_INTERPRETERS=false
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        python3 \
-        nodejs \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && if [ "$INCLUDE_INTERPRETERS" = "true" ]; then \
+           apt-get install -y --no-install-recommends python3 nodejs; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
-# Never run the gateway as root: its tools touch the filesystem.
-RUN useradd --system --create-home --uid 10001 omni
+# Never run the gateway as root: its tools touch the filesystem. A regular (not
+# --system) account, because a system account must have a uid below SYS_UID_MAX.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin omni
 
 # No --chown, which is what we want: COPY defaults to root:root and preserves
 # the source mode, so `omni` can read and execute these but never rewrite its
@@ -52,8 +57,9 @@ ENV OMNI_MCP_CONFIG=/etc/omni-mcp/omni-mcp.toml \
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/omni-mcp", "--config", "/etc/omni-mcp/omni-mcp.toml", "check"]
+# No HEALTHCHECK here: it is a Docker-format extension that OCI images (podman's
+# default) ignore with a warning. docker-compose.yml defines it instead, which
+# works for both runtimes.
 
 ENTRYPOINT ["/usr/local/bin/omni-mcp"]
 # HTTP mode requires server.auth_token; set OMNI_MCP_TOKEN in the environment.

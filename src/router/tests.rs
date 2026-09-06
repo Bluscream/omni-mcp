@@ -112,6 +112,7 @@ async fn omni_status_does_not_start_lazy_sidecars() {
             command: "sleep".into(),
             args: vec!["3600".into()],
             env: std::collections::BTreeMap::new(),
+            inherit_env: None,
             cwd: None,
             lazy: true,
             prefix: None,

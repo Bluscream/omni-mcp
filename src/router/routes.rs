@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::backend::{Backend, apply_prefix};
+use crate::error::ToolError;
 use crate::protocol::Tool;
 
 /// A resolved snapshot of what every backend serves.
@@ -58,7 +59,17 @@ impl Routes {
     /// tool list treats the whole gateway as broken.
     pub async fn discover(backends: &[Arc<dyn Backend>], timeout: Duration) -> Self {
         let queries = backends.iter().enumerate().map(|(index, backend)| async move {
-            let outcome = backend.list_tools(timeout).await;
+            // Enforce the deadline here rather than trusting each backend to
+            // honour it internally. A sidecar's connect phase is governed by its
+            // own startup_timeout, so without this outer bound a handful of slow
+            // sidecars could stall `tools/list` for minutes.
+            let outcome = match tokio::time::timeout(timeout, backend.list_tools(timeout)).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(ToolError::Timeout {
+                    tool: format!("{}:tools/list", backend.name()),
+                    seconds: timeout.as_secs(),
+                }),
+            };
             (index, Arc::clone(backend), outcome)
         });
         let results = futures::future::join_all(queries).await;
@@ -291,6 +302,45 @@ mod tests {
     fn stripping_tolerates_non_object_arguments() {
         assert_eq!(strip_injected_timeout(json!([1, 2])), json!([1, 2]));
         assert_eq!(strip_injected_timeout(json!(null)), json!(null));
+    }
+
+    /// A backend that never answers, to prove discovery is bounded.
+    struct Hangs;
+
+    #[async_trait]
+    impl Backend for Hangs {
+        fn name(&self) -> &'static str {
+            "hangs"
+        }
+        fn kind(&self) -> BackendKind {
+            BackendKind::Sidecar
+        }
+        async fn list_tools(&self, _t: Duration) -> ToolResult<Vec<Tool>> {
+            // Ignores the deadline it was handed, exactly like a sidecar stuck
+            // in its connect phase.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn call(&self, _n: &str, _a: Value, _t: Duration) -> ToolResult<CallToolResult> {
+            Ok(CallToolResult::text("x"))
+        }
+        async fn status(&self) -> BackendStatus {
+            BackendStatus::Idle
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_ignores_its_deadline_cannot_stall_discovery() {
+        let backends: Vec<Arc<dyn Backend>> =
+            vec![Arc::new(Hangs), Stub::serving("live", vec!["works"])];
+
+        let started = std::time::Instant::now();
+        let routes = Routes::discover(&backends, Duration::from_millis(200)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(5), "discovery was not bounded");
+        assert_eq!(routes.owner("works"), Some(1), "the healthy backend must still be listed");
+        assert_eq!(routes.failures().len(), 1);
+        assert_eq!(routes.failures()[0].0, "hangs");
     }
 
     #[tokio::test]

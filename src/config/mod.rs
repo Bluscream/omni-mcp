@@ -213,6 +213,15 @@ pub struct SidecarConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Names of parent environment variables this sidecar may see.
+    ///
+    /// Absent means it inherits the full environment, which is the historical
+    /// behaviour but rarely what you want: a desktop session commonly exports
+    /// API tokens for unrelated services, and every sidecar is third-party code
+    /// running with your privileges. Listing names here clears the environment
+    /// and passes through only those, plus whatever `env` sets explicitly.
+    #[serde(default)]
+    pub inherit_env: Option<Vec<String>>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
     /// Spawn on first use rather than at startup. Keeping this `true` is what

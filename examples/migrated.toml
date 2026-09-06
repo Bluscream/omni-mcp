@@ -1,0 +1,164 @@
+# omni-mcp — migrated from the MCP servers disabled on 2026-09-06.
+#
+# Every sidecar is `lazy`, so nothing spawns at IDE startup, and
+# `max_concurrent_spawns = 1` serialises the launches that do happen. That
+# combination is what prevents the process storm that took the machine down.
+#
+# Run these natively rather than through `distrobox enter` / `podman exec`. The
+# per-call container wrapper is what produced the OverlayFS lock contention.
+#
+# Secrets are `${VAR}` references, never literals. Required variables:
+#   OMNIROUTE_TOKEN                      (already exported)
+#   HASS_TOKEN                           (already exported)
+#   BROWSER_CONTROL_EXTENSION_SECRET     (new — see note on browser-control)
+#   EVERYTHING_HTTP_PASSWORD             (new — see note on everything-search)
+
+[server]
+host = "127.0.0.1"
+port = 8080
+auth_token = "${OMNI_MCP_TOKEN:-}"
+allowed_origins = []
+
+[tools]
+# Enable deliberately. `allowed_roots` confines the filesystem tools.
+allow_code_execution = false
+allow_file_mutation = false
+allowed_roots = ["/run/media/system/Data/Projects", "/var/home/blu"]
+
+[limits]
+default_tool_timeout = "30s"
+max_tool_timeout = "300s"
+discovery_timeout = "2500ms"
+discovery_ttl = "60s"
+max_concurrent_calls = 16
+max_concurrent_spawns = 1
+
+# =============================================================================
+# Proxies — remote MCP servers over HTTP
+# =============================================================================
+
+[[proxies]]
+name = "homeassistant"
+url = "${HASS_MCP_URL:-http://192.168.2.4:8123/api/mcp}"
+bearer = "${HASS_TOKEN}"
+prefix = "ha_"
+timeout = "30s"
+
+[[proxies]]
+name = "omniroute"
+url = "${OMNIROUTE_URL:-http://192.168.2.11:20128/api/mcp/sse}"
+bearer = "${OMNIROUTE_TOKEN}"
+prefix = "or_"
+timeout = "30s"
+
+[[proxies]]
+name = "vrcosc"
+url = "${VRCOSC_MCP_URL:-http://127.0.0.1:11370/mcp}"
+prefix = "vrc_"
+timeout = "15s"
+
+# =============================================================================
+# Sidecars — local MCP servers as child processes
+#
+# `inherit_env` is an allowlist. Without it a sidecar inherits the whole desktop
+# environment, which here exports credentials for GitHub, Tailscale, Docker,
+# Unraid, MQTT and more. Each sidecar gets only what it actually needs.
+# =============================================================================
+
+[[sidecars]]
+name = "ai-history"
+command = "node"
+args = ["/run/media/system/Data/Projects/MCPs/ai-history-mcp/dist/mcp/server.js"]
+inherit_env = ["PATH", "HOME", "USER", "LANG"]
+prefix = "hist_"
+lazy = true
+startup_timeout = "30s"
+
+[sidecars.env]
+QDRANT_URL = "${QDRANT_URL:-http://192.168.2.11:6333}"
+COLLECTION_NAME = "ai_history"
+
+[[sidecars]]
+name = "linux-gui"
+command = "/run/media/system/Data/Projects/MCPs/linux-gui-mcp/.venv/bin/python"
+args = ["/run/media/system/Data/Projects/MCPs/linux-gui-mcp/server.py"]
+# Needs the session bus and display to drive the desktop.
+inherit_env = [
+    "PATH", "HOME", "USER", "LANG",
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+    "DBUS_SESSION_BUS_ADDRESS",
+]
+prefix = "gui_"
+lazy = true
+startup_timeout = "30s"
+
+[[sidecars]]
+name = "browser-control"
+command = "node"
+args = ["/run/media/system/Data/Projects/MCPs/browser-control-mcp/mcp-server/dist/server.js"]
+inherit_env = ["PATH", "HOME", "USER", "LANG"]
+prefix = "br_"
+lazy = true
+
+[sidecars.env]
+# The old config had this UUID in plaintext; treat it as compromised and
+# regenerate it in the browser extension, then export the new value.
+EXTENSION_SECRET = "${BROWSER_CONTROL_EXTENSION_SECRET}"
+EXTENSION_PORT = "${BROWSER_CONTROL_EXTENSION_PORT:-8089}"
+
+[[sidecars]]
+name = "hass-lite"
+command = "node"
+args = ["/mnt/nas/projects/MCPs/hass-lite-mcp/build/index.js"]
+inherit_env = ["PATH", "HOME", "USER", "LANG", "HASS_SERVER", "HASS_TOKEN"]
+prefix = "hl_"
+lazy = true
+
+[[sidecars]]
+name = "everything-search"
+command = "node"
+args = ["/mnt/nas/projects/MCPs/everything-search-server/build/index.js"]
+inherit_env = ["PATH", "HOME", "USER", "LANG"]
+# The native `everything_search` tool has no HTTP-auth support, so this server
+# is kept rather than dropped. Prefixed to avoid shadowing the native one.
+prefix = "es_"
+lazy = true
+
+[sidecars.env]
+EVERYTHING_HTTP_USERNAME = "${EVERYTHING_HTTP_USERNAME:-blu}"
+EVERYTHING_HTTP_PASSWORD = "${EVERYTHING_HTTP_PASSWORD}"
+EVERYTHING_HTTP_PORT = "${EVERYTHING_HTTP_PORT:-14680}"
+
+[[sidecars]]
+name = "common"
+command = "node"
+args = ["/mnt/nas/projects/MCPs/common-mcp/dist/index.js"]
+inherit_env = ["PATH", "HOME", "USER", "LANG"]
+# Prefixed because its tools may overlap the native regex/count ones.
+prefix = "cm_"
+lazy = true
+
+[[sidecars]]
+name = "ssh"
+command = "npx"
+args = ["-y", "@aiondadotcom/mcp-ssh"]
+# SSH_AUTH_SOCK lets it use the running agent instead of on-disk keys.
+inherit_env = ["PATH", "HOME", "USER", "LANG", "SSH_AUTH_SOCK"]
+prefix = "ssh_"
+lazy = true
+# `npx -y` may fetch the package on first run.
+startup_timeout = "60s"
+
+# =============================================================================
+# Deliberately not migrated
+#
+#   resx-mcp   superseded by native read_resx / write_resx_entry, which fix a
+#              bug where new entries were written as escaped text rather than
+#              XML elements.
+#   diff-mcp   superseded by native diff_text / diff_json, and its path
+#              (/mnt/nas/projects/MCPs/jsondiffpatch/build/index.js) no longer
+#              exists.
+#
+# Re-add either as a sidecar with a prefix if you still want them.
+# =============================================================================

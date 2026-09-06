@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -28,6 +28,11 @@ impl ProxyBackend {
     /// rather than silently dropped, which is how the old code behaved.
     pub fn new(config: ProxyConfig, client: reqwest::Client) -> Result<Arc<Self>, ToolError> {
         let mut headers = HeaderMap::new();
+
+        // MCP's Streamable HTTP transport requires the client to accept both
+        // encodings; servers reject the request outright otherwise. Home
+        // Assistant answers 400 and omniroute 406 without this.
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/event-stream"));
 
         if let Some(bearer) = config.bearer.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
             let mut value = HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|_| {
@@ -223,11 +228,30 @@ mod tests {
     }
 
     #[test]
+    fn every_request_accepts_both_json_and_sse() {
+        // Live servers reject us without this: Home Assistant with 400 and
+        // omniroute with an explicit "must accept both" 406.
+        let backend =
+            ProxyBackend::new(config("http://x.invalid/mcp"), reqwest::Client::new()).unwrap();
+        let accept = backend.headers.get(ACCEPT).unwrap().to_str().unwrap();
+        assert!(accept.contains("application/json"), "{accept}");
+        assert!(accept.contains("text/event-stream"), "{accept}");
+    }
+
+    #[test]
     fn a_blank_bearer_does_not_produce_an_empty_authorization_header() {
         let mut cfg = config("http://x.invalid/mcp");
         cfg.bearer = Some("   ".into());
         let backend = ProxyBackend::new(cfg, reqwest::Client::new()).unwrap();
         assert!(backend.headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn a_configured_accept_header_overrides_the_default() {
+        let mut cfg = config("http://x.invalid/mcp");
+        cfg.headers.insert("accept".into(), "application/json".into());
+        let backend = ProxyBackend::new(cfg, reqwest::Client::new()).unwrap();
+        assert_eq!(backend.headers.get(ACCEPT).unwrap(), "application/json");
     }
 
     #[test]

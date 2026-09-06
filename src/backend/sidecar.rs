@@ -128,8 +128,22 @@ impl SidecarBackend {
         info!(sidecar = %cfg.name, command = %cfg.command, "spawning sidecar");
 
         let mut command = Command::new(&cfg.command);
+        command.args(&cfg.args);
+
+        // When an allowlist is configured, start from an empty environment and
+        // admit only the named variables. Without this a sidecar inherits every
+        // credential the desktop session exports, which is a lot of blast
+        // radius for third-party code we merely launch.
+        if let Some(allowed) = &cfg.inherit_env {
+            command.env_clear();
+            for name in allowed {
+                if let Ok(value) = std::env::var(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+
         command
-            .args(&cfg.args)
             .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -369,6 +383,7 @@ mod tests {
             command: command.into(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
             env: std::collections::BTreeMap::new(),
+            inherit_env: None,
             cwd: None,
             lazy: true,
             prefix: None,
@@ -533,6 +548,73 @@ mod tests {
             assert!(handle.await.unwrap().is_err());
         }
         assert!(started.elapsed() < Duration::from_secs(10), "some callers hung");
+    }
+
+    /// Echoes the value of an environment variable back as a tool result.
+    fn env_reporter(var: &str) -> SidecarConfig {
+        config(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    r#"
+                while IFS= read -r line; do
+                  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+                  case "$line" in
+                    *'"initialize"'*)
+                      echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{}}}}" ;;
+                    *'"tools/call"'*)
+                      echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"[${var}]\"}}]}}}}" ;;
+                  esac
+                done
+                "#
+                ),
+            ],
+        )
+    }
+
+    async fn reported_value(cfg: SidecarConfig) -> String {
+        let result = backend(cfg).call("t", json!({}), Duration::from_secs(10)).await.unwrap();
+        let crate::protocol::Content::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        text.clone()
+    }
+
+    #[tokio::test]
+    async fn without_an_allowlist_the_parent_environment_is_inherited() {
+        // SAFETY: test-local variable, not read concurrently by other threads.
+        unsafe { std::env::set_var("OMNI_TEST_INHERIT", "visible") };
+        let value = reported_value(env_reporter("OMNI_TEST_INHERIT")).await;
+        unsafe { std::env::remove_var("OMNI_TEST_INHERIT") };
+        assert_eq!(value.trim(), "[visible]");
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_hides_everything_it_does_not_name() {
+        // The motivating case: a desktop session exporting unrelated API tokens
+        // must not hand them to every sidecar it launches.
+        unsafe { std::env::set_var("OMNI_TEST_SECRET", "leaked") };
+
+        let mut cfg = env_reporter("OMNI_TEST_SECRET");
+        cfg.inherit_env = Some(vec!["PATH".into()]);
+        let hidden = reported_value(cfg).await;
+
+        let mut cfg = env_reporter("OMNI_TEST_SECRET");
+        cfg.inherit_env = Some(vec!["PATH".into(), "OMNI_TEST_SECRET".into()]);
+        let allowed = reported_value(cfg).await;
+
+        unsafe { std::env::remove_var("OMNI_TEST_SECRET") };
+        assert_eq!(hidden.trim(), "[]", "an unlisted variable leaked through");
+        assert_eq!(allowed.trim(), "[leaked]", "an explicitly listed variable was dropped");
+    }
+
+    #[tokio::test]
+    async fn explicit_env_still_applies_under_an_allowlist() {
+        let mut cfg = env_reporter("OMNI_TEST_EXPLICIT");
+        cfg.inherit_env = Some(vec!["PATH".into()]);
+        cfg.env.insert("OMNI_TEST_EXPLICIT".into(), "set-by-config".into());
+        assert_eq!(reported_value(cfg).await.trim(), "[set-by-config]");
     }
 
     #[tokio::test]
