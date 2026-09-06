@@ -71,6 +71,40 @@ const RUNTIMES: &[Runtime] = &[
         program: "dotnet",
         leading_args: &[],
     },
+    Runtime { names: &["java"], extension: "java", program: "java", leading_args: &[] },
+    Runtime { names: &["c"], extension: "c", program: "gcc", leading_args: &[] },
+    Runtime { names: &["cpp", "c++", "cxx"], extension: "cpp", program: "g++", leading_args: &[] },
+    Runtime { names: &["deno"], extension: "ts", program: "deno", leading_args: &["run", "-A"] },
+    Runtime { names: &["bun"], extension: "ts", program: "bun", leading_args: &["run"] },
+    Runtime { names: &["awk"], extension: "awk", program: "awk", leading_args: &["-f"] },
+    Runtime { names: &["tcl"], extension: "tcl", program: "tclsh", leading_args: &[] },
+    Runtime { names: &["r"], extension: "R", program: "Rscript", leading_args: &[] },
+    Runtime { names: &["julia", "jl"], extension: "jl", program: "julia", leading_args: &[] },
+    Runtime { names: &["elixir", "exs"], extension: "exs", program: "elixir", leading_args: &[] },
+    Runtime {
+        names: &["powershell", "pwsh"],
+        extension: "ps1",
+        program: "pwsh",
+        leading_args: &["-NoProfile", "-File"],
+    },
+    Runtime { names: &["zig"], extension: "zig", program: "zig", leading_args: &["run"] },
+    Runtime {
+        names: &["kotlin", "kt", "kts"],
+        extension: "kts",
+        program: "kotlinc",
+        leading_args: &["-script"],
+    },
+    Runtime { names: &["swift"], extension: "swift", program: "swift", leading_args: &[] },
+    Runtime { names: &["scala"], extension: "sc", program: "scala", leading_args: &[] },
+    Runtime { names: &["dart"], extension: "dart", program: "dart", leading_args: &["run"] },
+    Runtime { names: &["haskell", "hs"], extension: "hs", program: "runghc", leading_args: &[] },
+    Runtime { names: &["ocaml", "ml"], extension: "ml", program: "ocaml", leading_args: &[] },
+    Runtime {
+        names: &["fortran", "f90"],
+        extension: "f90",
+        program: "gfortran",
+        leading_args: &[],
+    },
 ];
 
 fn lookup(language: &str) -> ToolResult<&'static Runtime> {
@@ -93,32 +127,32 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-async fn build_command(
-    runtime: &Runtime,
+fn build_rust_command(script: &std::path::Path, workspace: &std::path::Path) -> (Command, String) {
+    if command_exists("rust-script") {
+        let mut cmd = Command::new("rust-script");
+        cmd.arg(script);
+        (cmd, "rust-script".to_string())
+    } else {
+        let out_bin = workspace.join("main_bin");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "rustc \"$1\" -o \"$2\" && exec \"$2\"", "--"]);
+        cmd.arg(script);
+        cmd.arg(&out_bin);
+        (cmd, "rustc".to_string())
+    }
+}
+
+async fn build_csharp_command(
     script: &std::path::Path,
     workspace: &std::path::Path,
 ) -> ToolResult<(Command, String)> {
-    if runtime.names.contains(&"rust") {
-        if command_exists("rust-script") {
-            let mut cmd = Command::new("rust-script");
-            cmd.arg(script);
-            Ok((cmd, "rust-script".to_string()))
-        } else {
-            let out_bin = workspace.join("main_bin");
-            let mut cmd = Command::new("sh");
-            cmd.args(["-c", "rustc \"$1\" -o \"$2\" && exec \"$2\"", "--"]);
-            cmd.arg(script);
-            cmd.arg(&out_bin);
-            Ok((cmd, "rustc".to_string()))
-        }
-    } else if runtime.names.contains(&"csharp") {
-        if command_exists("dotnet-script") {
-            let mut cmd = Command::new("dotnet-script");
-            cmd.arg(script);
-            Ok((cmd, "dotnet-script".to_string()))
-        } else {
-            let csproj = workspace.join("main.csproj");
-            let proj_xml = r#"<Project Sdk="Microsoft.NET.Sdk">
+    if command_exists("dotnet-script") {
+        let mut cmd = Command::new("dotnet-script");
+        cmd.arg(script);
+        Ok((cmd, "dotnet-script".to_string()))
+    } else {
+        let csproj = workspace.join("main.csproj");
+        let proj_xml = r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
@@ -126,15 +160,76 @@ async fn build_command(
     <Nullable>enable</Nullable>
   </PropertyGroup>
 </Project>"#;
-            tokio::fs::write(&csproj, proj_xml)
-                .await
-                .map_err(|e| ToolError::Failed(format!("could not create .csproj: {e}")))?;
+        tokio::fs::write(&csproj, proj_xml)
+            .await
+            .map_err(|e| ToolError::Failed(format!("could not create .csproj: {e}")))?;
 
-            let mut cmd = Command::new("dotnet");
-            cmd.args(["run", "--project"]);
-            cmd.arg(&csproj);
-            Ok((cmd, "dotnet".to_string()))
-        }
+        let mut cmd = Command::new("dotnet");
+        cmd.args(["run", "--project"]);
+        cmd.arg(&csproj);
+        Ok((cmd, "dotnet".to_string()))
+    }
+}
+
+fn build_c_command(script: &std::path::Path, workspace: &std::path::Path) -> (Command, String) {
+    let compiler = if command_exists("gcc") {
+        "gcc"
+    } else if command_exists("clang") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let out_bin = workspace.join("main_bin");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "\"$1\" \"$2\" -o \"$3\" && exec \"$3\"", "--", compiler]);
+    cmd.arg(script);
+    cmd.arg(&out_bin);
+    (cmd, compiler.to_string())
+}
+
+fn build_cpp_command(script: &std::path::Path, workspace: &std::path::Path) -> (Command, String) {
+    let compiler = if command_exists("g++") {
+        "g++"
+    } else if command_exists("clang++") {
+        "clang++"
+    } else {
+        "c++"
+    };
+    let out_bin = workspace.join("main_bin");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "\"$1\" -std=c++20 \"$2\" -o \"$3\" && exec \"$3\"", "--", compiler]);
+    cmd.arg(script);
+    cmd.arg(&out_bin);
+    (cmd, compiler.to_string())
+}
+
+fn build_fortran_command(
+    script: &std::path::Path,
+    workspace: &std::path::Path,
+) -> (Command, String) {
+    let out_bin = workspace.join("main_bin");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "gfortran \"$1\" -o \"$2\" && exec \"$2\"", "--"]);
+    cmd.arg(script);
+    cmd.arg(&out_bin);
+    (cmd, "gfortran".to_string())
+}
+
+async fn build_command(
+    runtime: &Runtime,
+    script: &std::path::Path,
+    workspace: &std::path::Path,
+) -> ToolResult<(Command, String)> {
+    if runtime.names.contains(&"rust") {
+        Ok(build_rust_command(script, workspace))
+    } else if runtime.names.contains(&"csharp") {
+        build_csharp_command(script, workspace).await
+    } else if runtime.names.contains(&"c") {
+        Ok(build_c_command(script, workspace))
+    } else if runtime.names.contains(&"cpp") {
+        Ok(build_cpp_command(script, workspace))
+    } else if runtime.names.contains(&"fortran") {
+        Ok(build_fortran_command(script, workspace))
     } else {
         let mut cmd = Command::new(runtime.program);
         cmd.args(runtime.leading_args);
@@ -465,6 +560,31 @@ mod tests {
         ("typescript", r#"console.log("ok")"#),
         ("rust", r#"fn main(){println!("ok");}"#),
         ("csharp", r#"System.Console.WriteLine("ok");"#),
+        (
+            "java",
+            "public class Main { public static void main(String[] args) { System.out.println(\"ok\"); } }",
+        ),
+        ("c", "#include <stdio.h>\nint main(){puts(\"ok\");return 0;}"),
+        ("cpp", "#include <iostream>\nint main(){std::cout << \"ok\" << std::endl;return 0;}"),
+        ("deno", r#"console.log("ok")"#),
+        ("bun", r#"console.log("ok")"#),
+        ("awk", "BEGIN { print \"ok\" }"),
+        ("tcl", "puts ok\n"),
+        ("r", r#"cat("ok\n")"#),
+        ("julia", r#"println("ok")"#),
+        ("elixir", r#"IO.puts("ok")"#),
+        ("powershell", "Write-Output ok"),
+        (
+            "zig",
+            "const std = @import(\"std\"); pub fn main() void { std.debug.print(\"ok\\n\", .{}); }",
+        ),
+        ("kotlin", "println(\"ok\")"),
+        ("swift", r#"print("ok")"#),
+        ("scala", r#"println("ok")"#),
+        ("dart", "void main() { print('ok'); }"),
+        ("haskell", "main = putStrLn \"ok\""),
+        ("ocaml", "print_endline \"ok\";;"),
+        ("fortran", "program main\n  print *, 'ok'\nend program main"),
     ];
 
     /// Whether the toolchain backing `language` is installed, accounting for
@@ -474,6 +594,9 @@ mod tests {
         match language {
             "rust" => which("rustc").is_some() || which("rust-script").is_some(),
             "csharp" => which("dotnet").is_some() || which("dotnet-script").is_some(),
+            "c" => which("gcc").is_some() || which("clang").is_some() || which("cc").is_some(),
+            "cpp" => which("g++").is_some() || which("clang++").is_some() || which("c++").is_some(),
+            "fortran" => which("gfortran").is_some(),
             _ => which(runtime.program).is_some(),
         }
     }
