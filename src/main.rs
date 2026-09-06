@@ -59,8 +59,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shared_registry = Arc::new(registry);
 
-    // Check if stdio mode requested
+    // Check CLI flags
     let args: Vec<String> = env::args().collect();
+    if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
+        println!("omni-mcp - High-performance consolidated MCP router in Rust");
+        println!("Usage: omni-mcp [--stdio|--help|--version]");
+        return Ok(());
+    }
+
+    if args.contains(&"--version".to_string()) || args.contains(&"-v".to_string()) {
+        println!("omni-mcp v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     if args.contains(&"--stdio".to_string()) {
         info!("Running in stdio mode...");
         let stdin = io::stdin();

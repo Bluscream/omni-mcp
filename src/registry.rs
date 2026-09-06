@@ -1,16 +1,84 @@
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::Arc;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::config::Config;
+use crate::config::{Config, SidecarConfig};
 use crate::traits::McpModule;
 use crate::types::{CallToolResult, JsonRpcRequest, JsonRpcResponse, Tool};
+
+#[allow(dead_code)]
+pub struct SidecarWorker {
+    pub name: String,
+    pub child: Mutex<Child>,
+    pub stdin: Mutex<ChildStdin>,
+    pub reader: Mutex<BufReader<ChildStdout>>,
+}
+
+impl SidecarWorker {
+    pub async fn spawn(cfg: &SidecarConfig) -> Result<Self, String> {
+        let mut cmd = tokio::process::Command::new(&cfg.command);
+        cmd.args(&cfg.args)
+            .envs(&cfg.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {}", cfg.command, e))?;
+        let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+        let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
+
+        Ok(Self {
+            name: cfg.name.clone(),
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            reader: Mutex::new(BufReader::new(stdout)),
+        })
+    }
+
+    pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, String> {
+        let req_json = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+
+        let mut req_str = serde_json::to_string(&req_json).map_err(|e| e.to_string())?;
+        req_str.push('\n');
+
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(req_str.as_bytes()).await.map_err(|e| format!("Stdin write error: {}", e))?;
+        stdin.flush().await.map_err(|e| format!("Stdin flush error: {}", e))?;
+
+        let mut reader = self.reader.lock().await;
+        let mut line = String::new();
+        reader.read_line(&mut line).await.map_err(|e| format!("Stdout read error: {}", e))?;
+
+        if line.trim().is_empty() {
+            return Err("Empty response from sidecar".to_string());
+        }
+
+        let resp: JsonRpcResponse = serde_json::from_str(&line).map_err(|e| format!("Invalid JSON from sidecar: {}", e))?;
+        if let Some(res) = resp.result {
+            Ok(res)
+        } else if let Some(err) = resp.error {
+            Err(err.message)
+        } else {
+            Err("Unknown sidecar response".to_string())
+        }
+    }
+}
 
 pub struct Registry {
     modules: HashMap<String, Arc<dyn McpModule>>,
     config: Config,
     client: reqwest::Client,
+    sidecars: Mutex<HashMap<String, Arc<SidecarWorker>>>,
 }
 
 impl Registry {
@@ -22,29 +90,38 @@ impl Registry {
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
+            sidecars: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Register a native Rust MCP module
     pub fn register<M: McpModule + 'static>(&mut self, module: M) {
         let name = module.name().to_string();
         info!("Registering native Rust MCP module: {}", name);
         self.modules.insert(name, Arc::new(module));
     }
 
-    /// Process an incoming JSON-RPC request
+    async fn get_or_spawn_sidecar(&self, name: &str) -> Result<Arc<SidecarWorker>, String> {
+        let mut sidecars = self.sidecars.lock().await;
+        if let Some(worker) = sidecars.get(name) {
+            return Ok(worker.clone());
+        }
+
+        let sidecar_cfg = self.config.sidecars.iter().find(|s| s.name == name)
+            .ok_or_else(|| format!("Sidecar config not found: {}", name))?;
+
+        info!("Spawning sidecar worker: {}", name);
+        let worker = Arc::new(SidecarWorker::spawn(sidecar_cfg).await?);
+        sidecars.insert(name.to_string(), worker.clone());
+        Ok(worker)
+    }
+
     pub async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         match req.method.as_str() {
             "initialize" => {
                 let result = json!({
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "omni-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "omni-mcp", "version": env!("CARGO_PKG_VERSION") }
                 });
                 JsonRpcResponse::success(req.id, result)
             }
@@ -52,32 +129,35 @@ impl Registry {
             "tools/list" => {
                 let mut all_tools = Vec::new();
 
-                // 0. Add omni-mcp system diagnostic tool
                 all_tools.push(Tool {
                     name: "omni_status".to_string(),
                     description: Some("Provides real-time health diagnostic status of all native tools, proxies, and sidecars in omni-mcp".to_string()),
                     input_schema: json!({ "type": "object", "properties": {} }),
                 });
 
-                // 1. Collect native Rust module tools
                 for module in self.modules.values() {
                     all_tools.extend(module.tools());
                 }
 
-                // 2. Query tools from HTTP/SSE proxies gracefully
                 for proxy in &self.config.proxies {
-                    match self.fetch_proxy_tools(proxy).await {
-                        Ok(proxy_tools) => {
-                            all_tools.extend(proxy_tools);
-                        }
-                        Err(err) => {
-                            info!("Proxy '{}' unavailable: {}", proxy.name, err);
+                    if let Ok(proxy_tools) = self.fetch_proxy_tools(proxy).await {
+                        all_tools.extend(proxy_tools);
+                    }
+                }
+
+                for sidecar in &self.config.sidecars {
+                    if let Ok(worker) = self.get_or_spawn_sidecar(&sidecar.name).await {
+                        if let Ok(res) = worker.request("tools/list", None).await {
+                            if let Some(tools_arr) = res.get("tools") {
+                                if let Ok(tools) = serde_json::from_value::<Vec<Tool>>(tools_arr.clone()) {
+                                    all_tools.extend(tools);
+                                }
+                            }
                         }
                     }
                 }
 
-                let result = json!({ "tools": all_tools });
-                JsonRpcResponse::success(req.id, result)
+                JsonRpcResponse::success(req.id, json!({ "tools": all_tools }))
             }
             "tools/call" => {
                 let params = match req.params {
@@ -92,7 +172,6 @@ impl Registry {
 
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-                // Handle system status diagnostic tool
                 if tool_name == "omni_status" {
                     let status_report = self.get_status_report().await;
                     return JsonRpcResponse::success(req.id, serde_json::to_value(CallToolResult::text(status_report)).unwrap());
@@ -103,26 +182,28 @@ impl Registry {
                     if module.tools().iter().any(|t| t.name == tool_name) {
                         match module.call_tool(tool_name, arguments.clone()).await {
                             Ok(res) => return JsonRpcResponse::success(req.id, serde_json::to_value(res).unwrap()),
-                            Err(e) => {
-                                let err_res = CallToolResult::error(format!("[omni-mcp Error] Tool '{}' failed: {}", tool_name, e));
-                                return JsonRpcResponse::success(req.id, serde_json::to_value(err_res).unwrap());
-                            }
+                            Err(e) => return JsonRpcResponse::success(req.id, serde_json::to_value(CallToolResult::error(format!("[omni-mcp Error] Tool '{}' failed: {}", tool_name, e))).unwrap()),
                         }
                     }
                 }
 
-                // 2. Check proxy targets gracefully
+                // 2. Check sidecars
+                for sidecar in &self.config.sidecars {
+                    if let Ok(worker) = self.get_or_spawn_sidecar(&sidecar.name).await {
+                        if let Ok(res) = worker.request("tools/call", Some(json!({ "name": tool_name, "arguments": arguments }))).await {
+                            return JsonRpcResponse::success(req.id, res);
+                        }
+                    }
+                }
+
+                // 3. Check proxy targets
                 for proxy in &self.config.proxies {
-                    match self.call_proxy_tool(proxy, tool_name, arguments.clone()).await {
-                        Ok(res) => return JsonRpcResponse::success(req.id, res),
-                        Err(e) => {
-                            info!("Call to tool '{}' via proxy '{}' failed: {}", tool_name, proxy.name, e);
-                        }
+                    if let Ok(res) = self.call_proxy_tool(proxy, tool_name, arguments.clone()).await {
+                        return JsonRpcResponse::success(req.id, res);
                     }
                 }
 
-                // Return explicit error feedback to agent
-                let not_found_msg = format!("[omni-mcp Feedback] Tool '{}' is currently unavailable or failed to respond. Call tool 'omni_status' to view active modules and diagnostics.", tool_name);
+                let not_found_msg = format!("[omni-mcp Feedback] Tool '{}' is currently unavailable. Call 'omni_status' to view active modules.", tool_name);
                 JsonRpcResponse::success(req.id, serde_json::to_value(CallToolResult::error(not_found_msg)).unwrap())
             }
             _ => JsonRpcResponse::error(req.id, -32601, format!("Method not found: {}", req.method)),
@@ -137,28 +218,27 @@ impl Registry {
             report.push_str(&format!("  - **{}**: ACTIVE (Loaded natively)\n", name));
         }
 
-        report.push_str("\n## 2. Configured Proxies & Remote Endpoints\n");
+        report.push_str("\n## 2. Managed Sidecars (Python, Node, Binaries)\n");
+        if self.config.sidecars.is_empty() {
+            report.push_str("  (No sidecars configured)\n");
+        } else {
+            for sidecar in &self.config.sidecars {
+                match self.get_or_spawn_sidecar(&sidecar.name).await {
+                    Ok(_) => report.push_str(&format!("  - **{}**: RUNNING (`{}`)\n", sidecar.name, sidecar.command)),
+                    Err(e) => report.push_str(&format!("  - **{}**: STOPPED / ERROR ({})\n", sidecar.name, e)),
+                }
+            }
+        }
+
+        report.push_str("\n## 3. Configured Proxies & Remote Endpoints\n");
         if self.config.proxies.is_empty() {
             report.push_str("  (No proxy endpoints configured)\n");
         } else {
             for proxy in &self.config.proxies {
                 match self.fetch_proxy_tools(proxy).await {
-                    Ok(tools) => {
-                        report.push_str(&format!("  - **{}** ({}): ONLINE ({} tools registered)\n", proxy.name, proxy.url, tools.len()));
-                    }
-                    Err(err) => {
-                        report.push_str(&format!("  - **{}** ({}): OFFLINE / UNREACHABLE\n    - *Reason*: {}\n", proxy.name, proxy.url, err));
-                    }
+                    Ok(tools) => report.push_str(&format!("  - **{}** ({}): ONLINE ({} tools registered)\n", proxy.name, proxy.url, tools.len())),
+                    Err(err) => report.push_str(&format!("  - **{}** ({}): OFFLINE / UNREACHABLE ({})\n", proxy.name, proxy.url, err)),
                 }
-            }
-        }
-
-        report.push_str("\n## 3. Configured Local Sidecars\n");
-        if self.config.sidecars.is_empty() {
-            report.push_str("  (No sidecar executables configured)\n");
-        } else {
-            for sidecar in &self.config.sidecars {
-                report.push_str(&format!("  - **{}**: Configured command: `{}` {}\n", sidecar.name, sidecar.command, sidecar.args.join(" ")));
             }
         }
 
@@ -183,11 +263,6 @@ impl Registry {
         }
 
         let resp = req_builder.send().await.map_err(|e| format!("Connection failed: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("HTTP status {}", resp.status()));
-        }
-
         let rpc_res: JsonRpcResponse = resp.json().await.map_err(|e| format!("Invalid JSON response: {}", e))?;
 
         if let Some(result) = rpc_res.result {
@@ -205,10 +280,7 @@ impl Registry {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": args
-            }
+            "params": { "name": name, "arguments": args }
         }));
 
         if let Some(token) = &proxy.token {
