@@ -46,6 +46,11 @@ russh = "0.63"
 russh-sftp = "2.4"
 sha2 = "0.10"
 base64 = "0.22"
+common-mcp = { git = "https://github.com/Bluscream/common-mcp", branch = "rust", version = "0.1.0" }
+resx-mcp = { git = "https://github.com/Bluscream/resx-mcp", branch = "rust", version = "0.1.0" }
+everything-search-mcp = { git = "https://github.com/Bluscream/everything-search-mcp", branch = "rust", version = "0.1.0" }
+ssh-mcp = { git = "https://github.com/Bluscream/ssh-mcp", branch = "main", version = "0.1.0" }
+mcp-toolkit = { git = "https://github.com/Bluscream/mcp-toolkit", branch = "main", version = "0.4.0" }
 
 [dev-dependencies]
 tokio = { version = "1.44", features = ["test-util"] }

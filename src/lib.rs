@@ -16,7 +16,6 @@ pub mod error;
 pub mod protocol;
 pub mod router;
 pub mod server;
-pub mod tools;
 
 pub use config::Config;
 pub use error::{StartupError, ToolError};

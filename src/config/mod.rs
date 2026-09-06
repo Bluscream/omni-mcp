@@ -202,67 +202,9 @@ impl Default for ToolPolicy {
     }
 }
 
-/// A configured remote SSH server profile.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SshServerConfig {
-    pub name: String,
-    pub host: String,
-    #[serde(default = "default_ssh_port")]
-    pub port: u16,
-    pub user: String,
-    #[serde(default)]
-    pub password: Option<String>,
-    #[serde(default)]
-    pub private_key: Option<PathBuf>,
-    #[serde(default)]
-    pub passphrase: Option<String>,
-    /// Optional pinned host key fingerprint (SHA256).
-    #[serde(default)]
-    pub fingerprint: Option<String>,
-    /// Optional SOCKS5 proxy e.g. `<socks5://127.0.0.1:1080>`.
-    #[serde(default)]
-    pub socks_proxy: Option<String>,
-    /// Command regex whitelist (if non-empty, commands must match).
-    #[serde(default)]
-    pub whitelist: Vec<String>,
-    /// Command regex blacklist (commands must not match).
-    #[serde(default)]
-    pub blacklist: Vec<String>,
-    /// If true, local paths for upload/download bypass `tools.allowed_roots`.
-    #[serde(default)]
-    pub bypass_allowed_roots: bool,
-    #[serde(default = "yes")]
-    pub enabled: bool,
-}
-
-impl SshServerConfig {
-    /// The pinned host key fingerprint in russh's canonical `SHA256:<base64>`
-    /// form, accepting a bare base64 digest for convenience.
-    ///
-    /// Without normalisation a fingerprint written without the `SHA256:` prefix
-    /// silently compares unequal, which surfaces to the operator as a host-key
-    /// *mismatch* — indistinguishable from an actual attack.
-    pub fn normalized_fingerprint(&self) -> Option<String> {
-        let raw = self.fingerprint.as_deref()?.trim();
-        if raw.is_empty() {
-            return None;
-        }
-        Some(match raw.strip_prefix("SHA256:") {
-            Some(digest) => format!("SHA256:{}", digest.trim()),
-            None => format!("SHA256:{raw}"),
-        })
-    }
-
-    /// Whether any authentication method is configured.
-    pub fn has_auth_method(&self) -> bool {
-        self.private_key.is_some() || self.password.as_deref().is_some_and(|p| !p.is_empty())
-    }
-}
-
-const fn default_ssh_port() -> u16 {
-    22
-}
+/// SSH server profiles come from `ssh-mcp`, which owns the format and its
+/// validation. Defining a second copy here is how the two drift apart.
+pub use ssh_mcp::config::SshServerConfig;
 
 /// A remote MCP server reached over HTTP.
 #[derive(Debug, Clone, Deserialize, Serialize)]
