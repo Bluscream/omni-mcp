@@ -22,6 +22,8 @@ use modules::common::CommonModule;
 use modules::diff::DiffModule;
 use modules::eval::EvalModule;
 use modules::everything::EverythingModule;
+use modules::grep::GrepModule;
+use modules::hex::HexModule;
 use modules::resx::ResxModule;
 use registry::Registry;
 use types::{JsonRpcRequest, JsonRpcResponse};
@@ -52,6 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register(ResxModule::new());
     registry.register(EverythingModule::new());
     registry.register(EvalModule::new());
+    registry.register(GrepModule::new());
+    registry.register(HexModule::new());
 
     let shared_registry = Arc::new(registry);
 
