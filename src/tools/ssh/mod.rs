@@ -4,9 +4,9 @@ pub mod known_hosts;
 pub mod pool;
 pub mod session;
 pub mod status;
+pub mod transfer;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -92,33 +92,15 @@ impl SshTools {
 
         Ok(())
     }
-
-    fn validate_local_path(
-        ctx: &ToolContext,
-        config: &SshServerConfig,
-        raw_path: &str,
-    ) -> ToolResult<PathBuf> {
-        if config.bypass_allowed_roots {
-            let path = Path::new(raw_path);
-            if path.is_relative() {
-                return Err(ToolError::InvalidArguments(format!(
-                    "path {raw_path:?} must be absolute"
-                )));
-            }
-            Ok(path.to_path_buf())
-        } else {
-            ctx.resolve(raw_path)
-        }
-    }
 }
 
 #[async_trait]
 impl NativeTool for SshTools {
     fn descriptors(&self) -> Vec<Tool> {
-        let mut tools = Vec::with_capacity(8);
-        tools.extend(execute_descriptors());
-        tools.extend(transfer_descriptors());
-        tools.extend(list_descriptors());
+        let mut tools = Vec::with_capacity(4);
+        tools.push(execute_descriptor());
+        tools.push(transfer::descriptor());
+        tools.push(list_descriptor());
         tools
     }
 
@@ -126,10 +108,9 @@ impl NativeTool for SshTools {
         ctx.require_ssh()?;
 
         match name {
-            "ssh_execute" | "execute-command" => self.execute_cmd(args).await,
-            "ssh_upload" | "upload" => self.upload_file(args, ctx).await,
-            "ssh_download" | "download" => self.download_file(args, ctx).await,
-            "ssh_list_servers" | "list-servers" => self.list_servers().await,
+            "ssh_execute" => self.execute_cmd(args).await,
+            "ssh_transfer" => self.transfer(args, ctx).await,
+            "ssh_list_servers" => self.list_servers().await,
             _ => Err(unknown(name)),
         }
     }
@@ -142,11 +123,7 @@ impl SshTools {
             None => args::string(&arguments, "cmdString")?,
         };
 
-        let server_name = match args::opt_string(&arguments, "server")? {
-            Some(s) => Some(s),
-            None => args::opt_string(&arguments, "connectionName")?,
-        };
-
+        let server_name = args::opt_string(&arguments, "server")?;
         let save_fp = args::bool_or(&arguments, "save_new_fingerprint", false)?;
         let config = self.resolve_server(server_name)?;
         Self::validate_command(config, cmd)?;
@@ -176,82 +153,13 @@ impl SshTools {
         Ok(result)
     }
 
-    async fn upload_file(&self, arguments: Value, ctx: &ToolContext) -> ToolResult<CallToolResult> {
-        let local_path_str = match args::opt_string(&arguments, "local_path")? {
-            Some(p) => p,
-            None => args::string(&arguments, "localPath")?,
-        };
-        let remote_path = match args::opt_string(&arguments, "remote_path")? {
-            Some(p) => p,
-            None => args::string(&arguments, "remotePath")?,
-        };
-        let server_name = match args::opt_string(&arguments, "server")? {
-            Some(s) => Some(s),
-            None => args::opt_string(&arguments, "connectionName")?,
-        };
+    async fn transfer(&self, arguments: Value, ctx: &ToolContext) -> ToolResult<CallToolResult> {
+        let server_name = args::opt_string(&arguments, "server")?;
         let save_fp = args::bool_or(&arguments, "save_new_fingerprint", false)?;
-
         let config = self.resolve_server(server_name)?;
-        let local_path = Self::validate_local_path(ctx, config, local_path_str)?;
-
-        let file_data = tokio::fs::read(&local_path).await.map_err(|e| {
-            ToolError::Failed(format!("failed to read local file '{}': {e}", local_path.display()))
-        })?;
 
         let session_arc = self.pool.get_or_connect(config, save_fp).await?;
-        let mut session = session_arc.lock().await;
-        let sftp = session.get_sftp().await?;
-
-        sftp.write(remote_path, &file_data).await.map_err(|e| {
-            ToolError::Failed(format!("failed to write remote file '{remote_path}': {e}"))
-        })?;
-
-        Ok(CallToolResult::text("File uploaded successfully"))
-    }
-
-    async fn download_file(
-        &self,
-        arguments: Value,
-        ctx: &ToolContext,
-    ) -> ToolResult<CallToolResult> {
-        ctx.require_file_mutation()?;
-
-        let remote_path = match args::opt_string(&arguments, "remote_path")? {
-            Some(p) => p,
-            None => args::string(&arguments, "remotePath")?,
-        };
-        let local_path_str = match args::opt_string(&arguments, "local_path")? {
-            Some(p) => p,
-            None => args::string(&arguments, "localPath")?,
-        };
-        let server_name = match args::opt_string(&arguments, "server")? {
-            Some(s) => Some(s),
-            None => args::opt_string(&arguments, "connectionName")?,
-        };
-        let save_fp = args::bool_or(&arguments, "save_new_fingerprint", false)?;
-
-        let config = self.resolve_server(server_name)?;
-        let local_path = Self::validate_local_path(ctx, config, local_path_str)?;
-
-        let session_arc = self.pool.get_or_connect(config, save_fp).await?;
-        let mut session = session_arc.lock().await;
-        let sftp = session.get_sftp().await?;
-
-        let data = sftp.read(remote_path).await.map_err(|e| {
-            ToolError::Failed(format!("failed to read remote file '{remote_path}': {e}"))
-        })?;
-
-        if let Some(parent) = local_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::Failed(format!("failed to create local parent directory: {e}"))
-            })?;
-        }
-
-        tokio::fs::write(&local_path, data).await.map_err(|e| {
-            ToolError::Failed(format!("failed to write local file '{}': {e}", local_path.display()))
-        })?;
-
-        Ok(CallToolResult::text("File downloaded successfully"))
+        transfer::run(&arguments, ctx, config, &session_arc).await
     }
 
     async fn list_servers(&self) -> ToolResult<CallToolResult> {
@@ -276,124 +184,40 @@ impl SshTools {
     }
 }
 
-fn execute_descriptors() -> Vec<Tool> {
-    vec![
-        Tool::new(
-            "ssh_execute",
-            "Execute command on connected SSH server and get stdout/stderr results. \
-             Access is denied unless `tools.allow_ssh = true` is configured in omni-mcp.toml.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "cmd": { "type": "string", "description": "Command to execute on the remote host" },
-                    "cmdString": { "type": "string", "description": "Alias for cmd" },
-                    "server": { "type": "string", "description": "Server profile name (optional, default is first configured server)" },
-                    "connectionName": { "type": "string", "description": "Alias for server" },
-                    "timeout": { "type": "integer", "description": "Execution timeout in seconds or milliseconds" },
-                    "save_new_fingerprint": { "type": "boolean", "description": "Set to true to acknowledge and re-pin host key fingerprint on mismatch" }
+fn execute_descriptor() -> Tool {
+    Tool::new(
+        "ssh_execute",
+        "Execute a shell command on a configured SSH server and return stdout, stderr, and exit \
+         code. Access is denied unless `tools.allow_ssh = true` is set in omni-mcp.toml.",
+        json!({
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string",
+                    "description": "Command to execute on the remote host"
+                },
+                "cmdString": {
+                    "type": "string",
+                    "description": "Alias for cmd (legacy compatibility)"
+                },
+                "server": {
+                    "type": "string",
+                    "description": "Server profile name from omni-mcp.toml (optional; defaults to first configured server)"
+                },
+                "save_new_fingerprint": {
+                    "type": "boolean",
+                    "description": "Set to true to acknowledge and re-pin the host key when a fingerprint mismatch is detected"
                 }
-            }),
-        ),
-        Tool::new(
-            "execute-command",
-            "Execute command on connected server and get output result (compatibility alias for ssh_execute).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "cmdString": { "type": "string", "description": "Command to execute" },
-                    "cmd": { "type": "string", "description": "Alias for cmdString" },
-                    "connectionName": { "type": "string", "description": "SSH connection name (optional)" },
-                    "server": { "type": "string", "description": "Alias for connectionName" },
-                    "timeout": { "type": "integer", "description": "Command execution timeout in milliseconds or seconds" },
-                    "save_new_fingerprint": { "type": "boolean", "description": "Set to true to acknowledge and re-pin host key fingerprint on mismatch" }
-                }
-            }),
-        ),
-    ]
+            }
+        }),
+    )
 }
 
-fn transfer_descriptors() -> Vec<Tool> {
-    vec![
-        Tool::new(
-            "ssh_upload",
-            "Upload a local file to a remote path on the connected SSH server via SFTP. \
-             Access is denied unless `tools.allow_ssh = true` is configured in omni-mcp.toml.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "local_path": { "type": "string", "description": "Path to local file to upload" },
-                    "localPath": { "type": "string", "description": "Alias for local_path" },
-                    "remote_path": { "type": "string", "description": "Destination path on the remote server" },
-                    "remotePath": { "type": "string", "description": "Alias for remote_path" },
-                    "server": { "type": "string", "description": "Server profile name (optional)" },
-                    "connectionName": { "type": "string", "description": "Alias for server" },
-                    "save_new_fingerprint": { "type": "boolean", "description": "Set to true to acknowledge and re-pin host key fingerprint on mismatch" }
-                }
-            }),
-        ),
-        Tool::new(
-            "upload",
-            "Upload file to connected server (compatibility alias for ssh_upload).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "localPath": { "type": "string", "description": "Local path" },
-                    "local_path": { "type": "string", "description": "Alias for localPath" },
-                    "remotePath": { "type": "string", "description": "Remote path" },
-                    "remote_path": { "type": "string", "description": "Alias for remotePath" },
-                    "connectionName": { "type": "string", "description": "SSH connection name (optional)" },
-                    "server": { "type": "string", "description": "Alias for connectionName" },
-                    "save_new_fingerprint": { "type": "boolean", "description": "Set to true to acknowledge and re-pin host key fingerprint on mismatch" }
-                }
-            }),
-        ),
-        Tool::new(
-            "ssh_download",
-            "Download a remote file to a local path from the connected SSH server via SFTP. \
-             Access is denied unless `tools.allow_ssh = true` is configured in omni-mcp.toml.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "remote_path": { "type": "string", "description": "Remote path to download from" },
-                    "remotePath": { "type": "string", "description": "Alias for remote_path" },
-                    "local_path": { "type": "string", "description": "Local destination path" },
-                    "localPath": { "type": "string", "description": "Alias for local_path" },
-                    "server": { "type": "string", "description": "Server profile name (optional)" },
-                    "connectionName": { "type": "string", "description": "Alias for server" },
-                    "save_new_fingerprint": { "type": "boolean", "description": "Set to true to acknowledge and re-pin host key fingerprint on mismatch" }
-                }
-            }),
-        ),
-        Tool::new(
-            "download",
-            "Download file from connected server (compatibility alias for ssh_download).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "remotePath": { "type": "string", "description": "Remote path" },
-                    "remote_path": { "type": "string", "description": "Alias for remotePath" },
-                    "localPath": { "type": "string", "description": "Local path" },
-                    "local_path": { "type": "string", "description": "Alias for localPath" },
-                    "connectionName": { "type": "string", "description": "SSH connection name (optional)" },
-                    "server": { "type": "string", "description": "Alias for connectionName" },
-                    "save_new_fingerprint": { "type": "boolean", "description": "Set to true to acknowledge and re-pin host key fingerprint on mismatch" }
-                }
-            }),
-        ),
-    ]
-}
-
-fn list_descriptors() -> Vec<Tool> {
-    vec![
-        Tool::new(
-            "ssh_list_servers",
-            "List all configured SSH servers along with active connection status and verbose hardware/system telemetry.",
-            json!({ "type": "object", "properties": {} }),
-        ),
-        Tool::new(
-            "list-servers",
-            "List all available SSH server configurations (compatibility alias for ssh_list_servers).",
-            json!({ "type": "object", "properties": {} }),
-        ),
-    ]
+fn list_descriptor() -> Tool {
+    Tool::new(
+        "ssh_list_servers",
+        "List all configured SSH servers with connection status and verbose hardware/system \
+         telemetry (CPU, RAM, disk, GPU, OS, uptime, processes, services).",
+        json!({ "type": "object", "properties": {} }),
+    )
 }
