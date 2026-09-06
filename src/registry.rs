@@ -32,12 +32,27 @@ impl SidecarWorker {
         let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
 
-        Ok(Self {
+        let worker = Self {
             name: cfg.name.clone(),
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             reader: Mutex::new(BufReader::new(stdout)),
-        })
+        };
+
+        let init_params = json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "omni-mcp", "version": env!("CARGO_PKG_VERSION") }
+        });
+        let _ = worker.request("initialize", Some(init_params)).await;
+
+        let notif_str = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+        let mut stdin_guard = worker.stdin.lock().await;
+        let _ = stdin_guard.write_all(notif_str.as_bytes()).await;
+        let _ = stdin_guard.flush().await;
+        drop(stdin_guard);
+
+        Ok(worker)
     }
 
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, String> {
@@ -120,94 +135,113 @@ impl Registry {
             "initialize" => {
                 let result = json!({
                     "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
+                    "capabilities": {
+                        "tools": {},
+                        "prompts": {},
+                        "resources": {},
+                        "logging": {}
+                    },
                     "serverInfo": { "name": "omni-mcp", "version": env!("CARGO_PKG_VERSION") }
                 });
                 JsonRpcResponse::success(req.id, result)
             }
+            "notifications/initialized" | "initialized" | "cancelled" | "$/cancelRequest" | "logging/setLevel" => {
+                JsonRpcResponse::success(req.id, json!({}))
+            }
             "ping" => JsonRpcResponse::success(req.id, json!({})),
+            "prompts/list" => JsonRpcResponse::success(req.id, json!({ "prompts": [] })),
+            "resources/list" => JsonRpcResponse::success(req.id, json!({ "resources": [] })),
+            "resources/templates/list" => JsonRpcResponse::success(req.id, json!({ "resourceTemplates": [] })),
             "tools/list" => {
-                let mut all_tools = Vec::new();
-
-                all_tools.push(Tool {
-                    name: "omni_status".to_string(),
-                    description: Some("Provides real-time health diagnostic status of all native tools, proxies, and sidecars in omni-mcp".to_string()),
-                    input_schema: json!({ "type": "object", "properties": {} }),
-                });
-
-                for module in self.modules.values() {
-                    all_tools.extend(module.tools());
-                }
-
-                for proxy in &self.config.proxies {
-                    if let Ok(proxy_tools) = self.fetch_proxy_tools(proxy).await {
-                        all_tools.extend(proxy_tools);
-                    }
-                }
-
-                for sidecar in &self.config.sidecars {
-                    if let Ok(worker) = self.get_or_spawn_sidecar(&sidecar.name).await {
-                        if let Ok(res) = worker.request("tools/list", None).await {
-                            if let Some(tools_arr) = res.get("tools") {
-                                if let Ok(tools) = serde_json::from_value::<Vec<Tool>>(tools_arr.clone()) {
-                                    all_tools.extend(tools);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                JsonRpcResponse::success(req.id, json!({ "tools": all_tools }))
+                let tools = self.handle_tools_list().await;
+                JsonRpcResponse::success(req.id, json!({ "tools": tools }))
             }
-            "tools/call" => {
-                let params = match req.params {
-                    Some(p) => p,
-                    None => return JsonRpcResponse::error(req.id, -32602, "Missing params".to_string()),
-                };
-
-                let tool_name = match params.get("name").and_then(|n| n.as_str()) {
-                    Some(n) => n,
-                    None => return JsonRpcResponse::error(req.id, -32602, "Missing tool name".to_string()),
-                };
-
-                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-                if tool_name == "omni_status" {
-                    let status_report = self.get_status_report().await;
-                    return JsonRpcResponse::success(req.id, serde_json::to_value(CallToolResult::text(status_report)).unwrap());
-                }
-
-                // 1. Check native Rust modules
-                for module in self.modules.values() {
-                    if module.tools().iter().any(|t| t.name == tool_name) {
-                        match module.call_tool(tool_name, arguments.clone()).await {
-                            Ok(res) => return JsonRpcResponse::success(req.id, serde_json::to_value(res).unwrap()),
-                            Err(e) => return JsonRpcResponse::success(req.id, serde_json::to_value(CallToolResult::error(format!("[omni-mcp Error] Tool '{}' failed: {}", tool_name, e))).unwrap()),
-                        }
-                    }
-                }
-
-                // 2. Check sidecars
-                for sidecar in &self.config.sidecars {
-                    if let Ok(worker) = self.get_or_spawn_sidecar(&sidecar.name).await {
-                        if let Ok(res) = worker.request("tools/call", Some(json!({ "name": tool_name, "arguments": arguments }))).await {
-                            return JsonRpcResponse::success(req.id, res);
-                        }
-                    }
-                }
-
-                // 3. Check proxy targets
-                for proxy in &self.config.proxies {
-                    if let Ok(res) = self.call_proxy_tool(proxy, tool_name, arguments.clone()).await {
-                        return JsonRpcResponse::success(req.id, res);
-                    }
-                }
-
-                let not_found_msg = format!("[omni-mcp Feedback] Tool '{}' is currently unavailable. Call 'omni_status' to view active modules.", tool_name);
-                JsonRpcResponse::success(req.id, serde_json::to_value(CallToolResult::error(not_found_msg)).unwrap())
-            }
+            "tools/call" => self.handle_tools_call(req.id, req.params).await,
             _ => JsonRpcResponse::error(req.id, -32601, format!("Method not found: {}", req.method)),
         }
+    }
+
+    async fn handle_tools_list(&self) -> Vec<Tool> {
+        let mut all_tools = Vec::new();
+
+        all_tools.push(Tool {
+            name: "omni_status".to_string(),
+            description: Some("Provides real-time health diagnostic status of all native tools, proxies, and sidecars in omni-mcp".to_string()),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        });
+
+        for module in self.modules.values() {
+            all_tools.extend(module.tools());
+        }
+
+        for proxy in &self.config.proxies {
+            let fetch = self.fetch_proxy_tools(proxy);
+            if let Ok(Ok(proxy_tools)) = tokio::time::timeout(std::time::Duration::from_millis(1500), fetch).await {
+                all_tools.extend(proxy_tools);
+            }
+        }
+
+        for sidecar in &self.config.sidecars {
+            if let Ok(Ok(worker)) = tokio::time::timeout(std::time::Duration::from_millis(1500), self.get_or_spawn_sidecar(&sidecar.name)).await {
+                if let Ok(Ok(res)) = tokio::time::timeout(std::time::Duration::from_millis(1500), worker.request("tools/list", None)).await {
+                    if let Some(tools_arr) = res.get("tools") {
+                        if let Ok(tools) = serde_json::from_value::<Vec<Tool>>(tools_arr.clone()) {
+                            all_tools.extend(tools);
+                        }
+                    }
+                }
+            }
+        }
+
+        all_tools
+    }
+
+    async fn handle_tools_call(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
+        let params = match params {
+            Some(p) => p,
+            None => return JsonRpcResponse::error(id, -32602, "Missing params".to_string()),
+        };
+
+        let tool_name = match params.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n,
+            None => return JsonRpcResponse::error(id, -32602, "Missing tool name".to_string()),
+        };
+
+        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+        if tool_name == "omni_status" {
+            let status_report = self.get_status_report().await;
+            return JsonRpcResponse::success(id, serde_json::to_value(CallToolResult::text(status_report)).unwrap());
+        }
+
+        // 1. Check native Rust modules
+        for module in self.modules.values() {
+            if module.tools().iter().any(|t| t.name == tool_name) {
+                match module.call_tool(tool_name, arguments.clone()).await {
+                    Ok(res) => return JsonRpcResponse::success(id, serde_json::to_value(res).unwrap()),
+                    Err(e) => return JsonRpcResponse::success(id, serde_json::to_value(CallToolResult::error(format!("[omni-mcp Error] Tool '{}' failed: {}", tool_name, e))).unwrap()),
+                }
+            }
+        }
+
+        // 2. Check sidecars
+        for sidecar in &self.config.sidecars {
+            if let Ok(worker) = self.get_or_spawn_sidecar(&sidecar.name).await {
+                if let Ok(res) = worker.request("tools/call", Some(json!({ "name": tool_name, "arguments": arguments }))).await {
+                    return JsonRpcResponse::success(id, res);
+                }
+            }
+        }
+
+        // 3. Check proxy targets
+        for proxy in &self.config.proxies {
+            if let Ok(res) = self.call_proxy_tool(proxy, tool_name, arguments.clone()).await {
+                return JsonRpcResponse::success(id, res);
+            }
+        }
+
+        let not_found_msg = format!("[omni-mcp Feedback] Tool '{}' is currently unavailable. Call 'omni_status' to view active modules.", tool_name);
+        JsonRpcResponse::success(id, serde_json::to_value(CallToolResult::error(not_found_msg)).unwrap())
     }
 
     async fn get_status_report(&self) -> String {

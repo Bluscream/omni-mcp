@@ -86,8 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&line) {
+                let has_id = req.id.is_some();
                 let resp = shared_registry.handle_request(req).await;
-                println!("{}", serde_json::to_string(&resp).unwrap_or_default());
+                if has_id {
+                    println!("{}", serde_json::to_string(&resp).unwrap_or_default());
+                }
             }
         }
         return Ok(());

@@ -48,7 +48,8 @@ if [ "$DEPLOY" = true ]; then
     
     mkdir -p "$INSTALL_BIN_DIR" "$INSTALL_CONFIG_DIR"
     
-    cp "$BINARY_PATH" "$INSTALL_BIN_DIR/omni-mcp"
+    cp "$BINARY_PATH" "$INSTALL_BIN_DIR/omni-mcp.new"
+    mv -f "$INSTALL_BIN_DIR/omni-mcp.new" "$INSTALL_BIN_DIR/omni-mcp"
     chmod +x "$INSTALL_BIN_DIR/omni-mcp"
     
     if [ -f "$PROJECT_DIR/omni-mcp.toml" ] && [ ! -f "$INSTALL_CONFIG_DIR/omni-mcp.toml" ]; then

@@ -3,9 +3,11 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
-    pub jsonrpc: String,
+    #[serde(default)]
+    pub jsonrpc: Option<String>,
     pub id: Option<Value>,
     pub method: String,
+    #[serde(default)]
     pub params: Option<Value>,
 }
 
@@ -54,6 +56,7 @@ impl JsonRpcResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
