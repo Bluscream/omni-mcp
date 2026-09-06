@@ -142,6 +142,11 @@ impl Default for Limits {
 
 /// Opt-in switches for tools that can execute code or modify files.
 ///
+/// Clippy's `struct_excessive_bools` is allowed deliberately: this is a
+/// capability flag set, and collapsing it into an enum would make each
+/// capability harder to read at the call site, not easier.
+#[allow(clippy::struct_excessive_bools)]
+///
 /// These default to *off*. The gateway is reachable over HTTP and drives
 /// arbitrary shells; enabling arbitrary code execution should be a decision the
 /// operator makes explicitly, not an accident of installing the binary.
@@ -154,6 +159,20 @@ pub struct ToolPolicy {
     /// Enables SSH and SFTP tools (`ssh_execute`, `ssh_upload`, `ssh_download`, `ssh_list_servers`).
     #[serde(default)]
     pub allow_ssh: bool,
+    /// Permits a tool call to overwrite a *mismatched* SSH host key.
+    ///
+    /// A fingerprint mismatch means either a legitimate key rotation or an
+    /// active man-in-the-middle. Deciding which is a judgement a human makes
+    /// with out-of-band knowledge; a model reading the error text cannot. With
+    /// this off (the default) `save_new_fingerprint` is refused and the
+    /// operator must update `known_hosts` or the pinned fingerprint themselves.
+    #[serde(default)]
+    pub allow_host_key_override: bool,
+    /// Permits recording a host key the first time a server is seen (TOFU).
+    ///
+    /// On by default, matching OpenSSH's `StrictHostKeyChecking=accept-new`.
+    #[serde(default = "yes")]
+    pub allow_host_key_learning: bool,
     /// Allows `grep_search` to rewrite files and `hex_patch` to modify binaries.
     #[serde(default)]
     pub allow_file_mutation: bool,
@@ -174,6 +193,8 @@ impl Default for ToolPolicy {
         Self {
             allow_code_execution: false,
             allow_ssh: false,
+            allow_host_key_override: false,
+            allow_host_key_learning: true,
             allow_file_mutation: false,
             allowed_roots: Vec::new(),
             max_file_bytes: default_max_file_bytes(),
@@ -213,6 +234,30 @@ pub struct SshServerConfig {
     pub bypass_allowed_roots: bool,
     #[serde(default = "yes")]
     pub enabled: bool,
+}
+
+impl SshServerConfig {
+    /// The pinned host key fingerprint in russh's canonical `SHA256:<base64>`
+    /// form, accepting a bare base64 digest for convenience.
+    ///
+    /// Without normalisation a fingerprint written without the `SHA256:` prefix
+    /// silently compares unequal, which surfaces to the operator as a host-key
+    /// *mismatch* — indistinguishable from an actual attack.
+    pub fn normalized_fingerprint(&self) -> Option<String> {
+        let raw = self.fingerprint.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(match raw.strip_prefix("SHA256:") {
+            Some(digest) => format!("SHA256:{}", digest.trim()),
+            None => format!("SHA256:{raw}"),
+        })
+    }
+
+    /// Whether any authentication method is configured.
+    pub fn has_auth_method(&self) -> bool {
+        self.private_key.is_some() || self.password.as_deref().is_some_and(|p| !p.is_empty())
+    }
 }
 
 const fn default_ssh_port() -> u16 {
@@ -360,7 +405,17 @@ impl Config {
             }
         }
 
+        self.validate_ssh()?;
+
+        Ok(())
+    }
+
+    /// Validates SSH server profiles. Split out of `validate` so each stays
+    /// readable as the profile surface grows.
+    fn validate_ssh(&self) -> Result<(), ConfigError> {
+        let invalid = |msg: String| Err(ConfigError::Invalid(msg));
         let mut ssh_seen = std::collections::HashSet::new();
+
         for s in &self.ssh {
             if s.name.trim().is_empty() {
                 return invalid("ssh server names must not be empty".into());
@@ -373,6 +428,42 @@ impl Config {
             }
             if s.user.trim().is_empty() {
                 return invalid(format!("ssh server {:?} has an empty user", s.name));
+            }
+
+            // An unparseable pattern used to be skipped silently. For a
+            // blacklist that fails *open*: a typo quietly disables the guard it
+            // was written to enforce.
+            for (kind, patterns) in [("whitelist", &s.whitelist), ("blacklist", &s.blacklist)] {
+                for pattern in patterns {
+                    if let Err(err) = regex::Regex::new(pattern) {
+                        return invalid(format!(
+                            "ssh server {:?} has an invalid {kind} pattern {pattern:?}: {err}",
+                            s.name
+                        ));
+                    }
+                }
+            }
+
+            if let Some(raw) = s.fingerprint.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+                let digest = raw.strip_prefix("SHA256:").unwrap_or(raw);
+                let plausible = !digest.is_empty()
+                    && digest
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=');
+                if !plausible {
+                    return invalid(format!(
+                        "ssh server {:?} has fingerprint {raw:?}, which is not a SHA256 digest;                          expected the `SHA256:<base64>` form shown by `ssh-keyscan -t ed25519 host \
+                         | ssh-keygen -lf -`",
+                        s.name
+                    ));
+                }
+            }
+
+            if !s.has_auth_method() {
+                return invalid(format!(
+                    "ssh server {:?} has neither `private_key` nor `password`; it could never                      authenticate",
+                    s.name
+                ));
             }
         }
 

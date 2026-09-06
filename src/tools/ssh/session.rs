@@ -11,6 +11,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::known_hosts::KnownHostsStore;
+
+/// Cap on captured stdout/stderr per remote command, mirroring `eval_code`.
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
 use crate::config::SshServerConfig;
 use crate::error::{ToolError, ToolResult};
 
@@ -26,8 +30,13 @@ pub struct ClientKeyHandler {
     host: String,
     port: u16,
     pinned_fingerprint: Option<String>,
+    /// A fingerprint the operator accepted earlier in this process run. It
+    /// cannot be written back to omni-mcp.toml, so without remembering it every
+    /// later connection would mismatch again and demand another override.
+    accepted_fingerprint: Option<String>,
     known_hosts: Arc<KnownHostsStore>,
     save_new_fingerprint: bool,
+    allow_learning: bool,
     verification: Arc<Mutex<Option<KeyVerification>>>,
 }
 
@@ -40,6 +49,14 @@ impl Handler for ClientKeyHandler {
     ) -> Result<bool, Self::Error> {
         let pk = server_public_key.public_key();
         let received = pk.fingerprint(HashAlg::Sha256).to_string();
+
+        // A fingerprint accepted earlier in this run counts as trusted, so a
+        // single override does not have to be repeated for every later call.
+        if self.accepted_fingerprint.as_deref() == Some(received.as_str()) {
+            let mut v = self.verification.lock().await;
+            *v = Some(KeyVerification::Trusted);
+            return Ok(true);
+        }
 
         // 1. If fingerprint is configured in omni-mcp.toml, treat it as authoritative
         if let Some(pinned) = &self.pinned_fingerprint {
@@ -85,6 +102,14 @@ impl Handler for ClientKeyHandler {
                 }
             }
             None => {
+                if !self.allow_learning {
+                    let mut v = self.verification.lock().await;
+                    *v = Some(KeyVerification::Mismatch {
+                        pinned: "no recorded key (host-key learning is disabled)".to_string(),
+                        received,
+                    });
+                    return Ok(false);
+                }
                 // Host not recorded yet: TOFU learn into ~/.ssh/known_hosts
                 info!(host = %self.host, port = %self.port, %received, "recording new host in ~/.ssh/known_hosts");
                 let _ = self.known_hosts.learn(&self.host, self.port, &pk).await;
@@ -99,6 +124,15 @@ impl Handler for ClientKeyHandler {
 pub struct SshSessionHandle {
     handle: Handle<ClientKeyHandler>,
     sftp: Option<SftpSession>,
+    /// Set when this connection accepted a previously unknown or changed key.
+    accepted_fingerprint: Option<String>,
+}
+
+impl SshSessionHandle {
+    /// The host key accepted during this handshake, if it was new.
+    pub fn accepted_fingerprint(&self) -> Option<&str> {
+        self.accepted_fingerprint.as_deref()
+    }
 }
 
 impl SshSessionHandle {
@@ -111,6 +145,8 @@ impl SshSessionHandle {
         config: &SshServerConfig,
         known_hosts: Arc<KnownHostsStore>,
         save_new_fingerprint: bool,
+        allow_learning: bool,
+        accepted_fingerprint: Option<String>,
         mismatch_out: &std::sync::Mutex<Option<(String, String)>>,
     ) -> ToolResult<Self> {
         let verification = Arc::new(Mutex::new(None));
@@ -118,9 +154,11 @@ impl SshSessionHandle {
         let handler = ClientKeyHandler {
             host: config.host.clone(),
             port: config.port,
-            pinned_fingerprint: config.fingerprint.clone(),
+            pinned_fingerprint: config.normalized_fingerprint(),
+            accepted_fingerprint,
             known_hosts: Arc::clone(&known_hosts),
             save_new_fingerprint,
+            allow_learning,
             verification: Arc::clone(&verification),
         };
 
@@ -161,7 +199,12 @@ impl SshSessionHandle {
 
         authenticate(&mut handle, config).await?;
 
-        Ok(Self { handle, sftp: None })
+        let accepted = match verification.lock().await.clone() {
+            Some(KeyVerification::NewPinned(fp)) => Some(fp),
+            _ => None,
+        };
+
+        Ok(Self { handle, sftp: None, accepted_fingerprint: accepted })
     }
 
     pub fn is_alive(&self) -> bool {
@@ -181,23 +224,42 @@ impl SshSessionHandle {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut truncated = false;
         let mut exit_code = 0;
+
+        // A remote command is untrusted output of unbounded length: `cat
+        // /dev/urandom` would otherwise grow these buffers until the process
+        // dies. Keep reading so the channel closes cleanly, but stop storing.
+        let append = |buffer: &mut Vec<u8>, data: &[u8], truncated: &mut bool| {
+            let room = MAX_OUTPUT_BYTES.saturating_sub(buffer.len());
+            if room == 0 {
+                *truncated = true;
+                return;
+            }
+            let take = data.len().min(room);
+            buffer.extend_from_slice(&data[..take]);
+            *truncated |= take < data.len();
+        };
 
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                ChannelMsg::Data { data } => append(&mut stdout, &data, &mut truncated),
+                ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    append(&mut stderr, &data, &mut truncated);
+                }
                 ChannelMsg::ExitStatus { exit_status } => exit_code = exit_status,
                 ChannelMsg::Close => break,
                 _ => {}
             }
         }
 
-        Ok((
-            String::from_utf8_lossy(&stdout).into_owned(),
-            String::from_utf8_lossy(&stderr).into_owned(),
-            exit_code,
-        ))
+        let mut out = String::from_utf8_lossy(&stdout).into_owned();
+        if truncated {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\n[omni-mcp: output truncated at {MAX_OUTPUT_BYTES} bytes]");
+        }
+
+        Ok((out, String::from_utf8_lossy(&stderr).into_owned(), exit_code))
     }
 
     pub async fn get_sftp(&mut self) -> ToolResult<&SftpSession> {

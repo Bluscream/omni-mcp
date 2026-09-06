@@ -24,6 +24,9 @@ use status::ServerStatus;
 
 pub struct SshTools {
     servers: HashMap<String, SshServerConfig>,
+    /// Mirrors `tools.allow_host_key_override`, so `descriptors()` (which has
+    /// no `ToolContext`) does not advertise an override that would be refused.
+    allow_key_override: bool,
     default_server: Option<String>,
     pool: SessionPool,
     status_cache: Arc<Mutex<HashMap<String, ServerStatus>>>,
@@ -31,8 +34,20 @@ pub struct SshTools {
 
 impl SshTools {
     pub fn new(configs: Vec<SshServerConfig>) -> Self {
+        Self::with_policy(configs, false)
+    }
+
+    pub fn with_policy(configs: Vec<SshServerConfig>, allow_key_override: bool) -> Self {
+        Self::with_full_policy(configs, allow_key_override, true)
+    }
+
+    pub fn with_full_policy(
+        configs: Vec<SshServerConfig>,
+        allow_key_override: bool,
+        allow_learning: bool,
+    ) -> Self {
         let known_hosts = Arc::new(KnownHostsStore::new(KnownHostsStore::default_path()));
-        let pool = SessionPool::new(known_hosts);
+        let pool = SessionPool::with_learning(known_hosts, allow_learning);
         let mut servers = HashMap::new();
         let mut first = None;
 
@@ -47,6 +62,7 @@ impl SshTools {
 
         Self {
             servers,
+            allow_key_override,
             default_server: first,
             pool,
             status_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -112,7 +128,7 @@ impl NativeTool for SshTools {
     fn descriptors(&self) -> Vec<Tool> {
         // Include save_new_fingerprint in schemas only when at least one server
         // has a pending mismatch. That way the agent sees it exactly when it's needed.
-        let mismatch_active = self.any_mismatch_pending();
+        let mismatch_active = self.any_mismatch_pending() && self.allow_key_override;
 
         let mut tools = Vec::with_capacity(4);
         tools.push(execute_descriptor(mismatch_active));
@@ -125,7 +141,7 @@ impl NativeTool for SshTools {
         ctx.require_ssh()?;
 
         match name {
-            "ssh_execute" => self.execute_cmd(args).await,
+            "ssh_execute" => self.execute_cmd(args, ctx).await,
             "ssh_transfer" => self.transfer(args, ctx).await,
             "ssh_list_servers" => self.list_servers().await,
             _ => Err(unknown(name)),
@@ -134,7 +150,7 @@ impl NativeTool for SshTools {
 }
 
 impl SshTools {
-    async fn execute_cmd(&self, arguments: Value) -> ToolResult<CallToolResult> {
+    async fn execute_cmd(&self, arguments: Value, ctx: &ToolContext) -> ToolResult<CallToolResult> {
         let cmd = match args::opt_string(&arguments, "cmd")? {
             Some(c) => c,
             None => args::string(&arguments, "cmdString")?,
@@ -142,9 +158,7 @@ impl SshTools {
 
         let server_name = args::opt_string(&arguments, "server")?;
 
-        // Only honour save_new_fingerprint when a real mismatch is pending for this server.
-        let save_fp = self.server_has_mismatch(server_name)
-            && args::bool_or(&arguments, "save_new_fingerprint", false)?;
+        let save_fp = self.requested_key_override(&arguments, server_name, ctx)?;
 
         let config = self.resolve_server(server_name)?;
         Self::validate_command(config, cmd)?;
@@ -177,13 +191,37 @@ impl SshTools {
     async fn transfer(&self, arguments: Value, ctx: &ToolContext) -> ToolResult<CallToolResult> {
         let server_name = args::opt_string(&arguments, "server")?;
 
-        // Only honour save_new_fingerprint when a real mismatch is pending for this server.
-        let save_fp = self.server_has_mismatch(server_name)
-            && args::bool_or(&arguments, "save_new_fingerprint", false)?;
+        let save_fp = self.requested_key_override(&arguments, server_name, ctx)?;
 
         let config = self.resolve_server(server_name)?;
         let session_arc = self.pool.get_or_connect(config, save_fp).await?;
         transfer::run(&arguments, ctx, config, &session_arc).await
+    }
+
+    /// Decides whether this call may overwrite a mismatched host key.
+    ///
+    /// Three conditions must hold: the caller asked, a mismatch is genuinely
+    /// pending for that server, and the operator has enabled the override in
+    /// configuration. The last is the important one — a fingerprint mismatch is
+    /// either a key rotation or an active attack, and only a human can tell
+    /// them apart. Letting the model set a boolean to silence the warning makes
+    /// the whole check ceremonial.
+    fn requested_key_override(
+        &self,
+        arguments: &Value,
+        server_name: Option<&str>,
+        ctx: &ToolContext,
+    ) -> ToolResult<bool> {
+        if !args::bool_or(arguments, "save_new_fingerprint", false)? {
+            return Ok(false);
+        }
+        if !self.server_has_mismatch(server_name) {
+            // Nothing to override; ignore rather than fail, since the parameter
+            // may linger in a retry after the mismatch was resolved.
+            return Ok(false);
+        }
+        ctx.require_host_key_override()?;
+        Ok(true)
     }
 
     async fn list_servers(&self) -> ToolResult<CallToolResult> {
@@ -255,3 +293,6 @@ fn list_descriptor() -> Tool {
         json!({ "type": "object", "properties": {} }),
     )
 }
+
+#[cfg(test)]
+mod tests;

@@ -13,7 +13,7 @@ pub mod text;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::config::SshServerConfig;
+use crate::config::{SshServerConfig, ToolPolicy};
 use crate::error::{ToolError, ToolResult};
 use crate::protocol::{CallToolResult, Tool};
 pub use context::ToolContext;
@@ -30,11 +30,17 @@ pub trait NativeTool: Send + Sync {
 
 /// Every native tool group, in registration order.
 pub fn all() -> Vec<Box<dyn NativeTool>> {
-    all_with_ssh(Vec::new())
+    all_with_ssh(Vec::new(), &ToolPolicy::default())
 }
 
 /// Every native tool group including configured SSH server profiles.
-pub fn all_with_ssh(ssh_configs: Vec<SshServerConfig>) -> Vec<Box<dyn NativeTool>> {
+///
+/// `policy` is needed at construction because `descriptors()` has no context and
+/// must not advertise a host-key override the operator has disabled.
+pub fn all_with_ssh(
+    ssh_configs: Vec<SshServerConfig>,
+    policy: &ToolPolicy,
+) -> Vec<Box<dyn NativeTool>> {
     vec![
         Box::new(text::TextTools),
         Box::new(fs::FsTools),
@@ -42,7 +48,11 @@ pub fn all_with_ssh(ssh_configs: Vec<SshServerConfig>) -> Vec<Box<dyn NativeTool
         Box::new(resx::ResxTools),
         Box::new(search::SearchTools::new()),
         Box::new(eval::EvalTools),
-        Box::new(ssh::SshTools::new(ssh_configs)),
+        Box::new(ssh::SshTools::with_full_policy(
+            ssh_configs,
+            policy.allow_host_key_override,
+            policy.allow_host_key_learning,
+        )),
     ]
 }
 

@@ -60,6 +60,27 @@ impl ToolContext {
         ))
     }
 
+    /// Fails unless `tools.allow_host_key_override` is set.
+    ///
+    /// This gate exists because the alternative is letting a model decide that
+    /// a possible man-in-the-middle is "probably just a key rotation".
+    pub fn require_host_key_override(&self) -> ToolResult<()> {
+        if self.policy.allow_host_key_override {
+            return Ok(());
+        }
+        Err(ToolError::Denied(
+            "refusing to overwrite a mismatched SSH host key. This is a decision for a human: \
+             verify the new key out of band, then either update ~/.ssh/known_hosts yourself or \
+             set `allow_host_key_override = true` under [tools] in omni-mcp.toml"
+                .into(),
+        ))
+    }
+
+    /// Whether recording a previously unseen host key (TOFU) is permitted.
+    pub fn allows_host_key_learning(&self) -> bool {
+        self.policy.allow_host_key_learning
+    }
+
     /// Fails unless `tools.allow_file_mutation` is set.
     pub fn require_file_mutation(&self) -> ToolResult<()> {
         if self.policy.allow_file_mutation {

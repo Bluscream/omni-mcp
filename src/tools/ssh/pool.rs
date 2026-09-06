@@ -29,14 +29,28 @@ pub struct SessionPool {
     /// Cleared when the server successfully connects (with or without re-pinning).
     /// Uses a `std::sync::Mutex` so `descriptors()` can read it without `.await`.
     pub mismatch_pending: Arc<std::sync::Mutex<HashMap<String, MismatchInfo>>>,
+    /// Host keys the operator accepted during this process run.
+    ///
+    /// An override cannot rewrite `fingerprint` in omni-mcp.toml, so without
+    /// this every subsequent connection would mismatch again and demand another
+    /// override — an approval loop that trains the operator to always say yes.
+    accepted: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Mirrors `tools.allow_host_key_learning`.
+    allow_learning: bool,
 }
 
 impl SessionPool {
     pub fn new(known_hosts: Arc<KnownHostsStore>) -> Self {
+        Self::with_learning(known_hosts, true)
+    }
+
+    pub fn with_learning(known_hosts: Arc<KnownHostsStore>, allow_learning: bool) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             known_hosts,
             mismatch_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            accepted: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            allow_learning,
         }
     }
 
@@ -76,10 +90,15 @@ impl SessionPool {
         // Out-param: populated by connect() on mismatch before returning Err.
         let mismatch_out = std::sync::Mutex::new(None::<(String, String)>);
 
+        let accepted_fingerprint =
+            self.accepted.lock().ok().and_then(|a| a.get(&config.name).cloned());
+
         let result = SshSessionHandle::connect(
             config,
             Arc::clone(&self.known_hosts),
             effective_save,
+            self.allow_learning,
+            accepted_fingerprint,
             &mismatch_out,
         )
         .await;
@@ -89,6 +108,13 @@ impl SessionPool {
                 // Successful connect: clear any stale mismatch for this server.
                 if let Ok(mut pending) = self.mismatch_pending.lock() {
                     pending.remove(&config.name);
+                }
+                // Remember a newly accepted key so the next call does not have
+                // to be approved all over again.
+                if let Some(fingerprint) = session.accepted_fingerprint() {
+                    if let Ok(mut accepted) = self.accepted.lock() {
+                        accepted.insert(config.name.clone(), fingerprint.to_string());
+                    }
                 }
                 let arc_session = Arc::new(Mutex::new(session));
                 map.insert(config.name.clone(), Arc::clone(&arc_session));

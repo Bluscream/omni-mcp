@@ -44,7 +44,8 @@ impl NativeBackend {
         ssh_configs: Vec<crate::config::SshServerConfig>,
         context: ToolContext,
     ) -> Self {
-        Self::new(crate::tools::all_with_ssh(ssh_configs), context)
+        let policy = context.policy().clone();
+        Self::new(crate::tools::all_with_ssh(ssh_configs, &policy), context)
     }
 
     pub fn handles(&self, tool: &str) -> bool {
