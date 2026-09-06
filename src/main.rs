@@ -90,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let resp = shared_registry.handle_request(req).await;
                 if has_id {
                     println!("{}", serde_json::to_string(&resp).unwrap_or_default());
+                    let _ = std::io::Write::flush(&mut io::stdout());
                 }
             }
         }

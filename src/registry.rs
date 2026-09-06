@@ -193,7 +193,16 @@ impl Registry {
             }
         }
 
-        all_tools
+        all_tools.into_iter().map(|t| t.ensure_timeout_param()).collect()
+    }
+
+    fn extract_timeout(arguments: &Value) -> std::time::Duration {
+        let secs = arguments.get("timeout")
+            .and_then(|v| v.as_u64())
+            .or_else(|| arguments.get("timeout_ms").and_then(|v| v.as_u64().map(|ms| ms.div_ceil(1000))))
+            .unwrap_or(30)
+            .clamp(1, 300);
+        std::time::Duration::from_secs(secs)
     }
 
     async fn handle_tools_call(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
@@ -208,19 +217,31 @@ impl Registry {
         };
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+        let timeout_dur = Self::extract_timeout(&arguments);
 
+        let execution = self.execute_tool(tool_name, arguments);
+        match tokio::time::timeout(timeout_dur, execution).await {
+            Ok(resp_val) => JsonRpcResponse::success(id, resp_val),
+            Err(_) => {
+                let err_msg = format!("[omni-mcp Timeout] Tool '{}' exceeded hard-cap timeout of {}s", tool_name, timeout_dur.as_secs());
+                JsonRpcResponse::success(id, serde_json::to_value(CallToolResult::error(err_msg)).unwrap())
+            }
+        }
+    }
+
+    async fn execute_tool(&self, tool_name: &str, arguments: Value) -> Value {
         if tool_name == "omni_status" {
             let status_report = self.get_status_report().await;
-            return JsonRpcResponse::success(id, serde_json::to_value(CallToolResult::text(status_report)).unwrap());
+            return serde_json::to_value(CallToolResult::text(status_report)).unwrap();
         }
 
         // 1. Check native Rust modules
         for module in self.modules.values() {
             if module.tools().iter().any(|t| t.name == tool_name) {
-                match module.call_tool(tool_name, arguments.clone()).await {
-                    Ok(res) => return JsonRpcResponse::success(id, serde_json::to_value(res).unwrap()),
-                    Err(e) => return JsonRpcResponse::success(id, serde_json::to_value(CallToolResult::error(format!("[omni-mcp Error] Tool '{}' failed: {}", tool_name, e))).unwrap()),
-                }
+                return match module.call_tool(tool_name, arguments).await {
+                    Ok(res) => serde_json::to_value(res).unwrap(),
+                    Err(e) => serde_json::to_value(CallToolResult::error(format!("[omni-mcp Error] Tool '{}' failed: {}", tool_name, e))).unwrap(),
+                };
             }
         }
 
@@ -228,7 +249,7 @@ impl Registry {
         for sidecar in &self.config.sidecars {
             if let Ok(worker) = self.get_or_spawn_sidecar(&sidecar.name).await {
                 if let Ok(res) = worker.request("tools/call", Some(json!({ "name": tool_name, "arguments": arguments }))).await {
-                    return JsonRpcResponse::success(id, res);
+                    return res;
                 }
             }
         }
@@ -236,12 +257,12 @@ impl Registry {
         // 3. Check proxy targets
         for proxy in &self.config.proxies {
             if let Ok(res) = self.call_proxy_tool(proxy, tool_name, arguments.clone()).await {
-                return JsonRpcResponse::success(id, res);
+                return res;
             }
         }
 
         let not_found_msg = format!("[omni-mcp Feedback] Tool '{}' is currently unavailable. Call 'omni_status' to view active modules.", tool_name);
-        JsonRpcResponse::success(id, serde_json::to_value(CallToolResult::error(not_found_msg)).unwrap())
+        serde_json::to_value(CallToolResult::error(not_found_msg)).unwrap()
     }
 
     async fn get_status_report(&self) -> String {

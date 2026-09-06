@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -60,6 +60,26 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+}
+
+impl Tool {
+    pub fn ensure_timeout_param(mut self) -> Self {
+        if let Some(obj) = self.input_schema.as_object_mut() {
+            let properties = obj.entry("properties").or_insert_with(|| json!({}));
+            if let Some(props_obj) = properties.as_object_mut() {
+                if !props_obj.contains_key("timeout") && !props_obj.contains_key("timeout_ms") {
+                    props_obj.insert(
+                        "timeout".to_string(),
+                        json!({
+                            "type": "integer",
+                            "description": "Optional execution timeout in seconds (default: 30s, max: 300s). Hard-caps execution time."
+                        }),
+                    );
+                }
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
