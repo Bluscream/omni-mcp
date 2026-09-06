@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  omni-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: omni-mcp
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../omni-mcp.toml:/app/omni-mcp.toml:ro
+    environment:
+      - OMNI_MCP_CONFIG=/app/omni-mcp.toml

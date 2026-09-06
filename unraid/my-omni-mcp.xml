@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>omni-mcp</Name>
+  <Repository>bluscream/omni-mcp:latest</Repository>
+  <Registry>https://hub.docker.com/r/bluscream/omni-mcp</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Bluscream/omni-mcp/issues</Support>
+  <Project>https://github.com/Bluscream/omni-mcp</Project>
+  <Overview>High-performance, consolidated Model Context Protocol (MCP) router and native Rust module server. Provides instant, sub-millisecond execution and proxy capabilities for AI IDEs like Antigravity IDE and Claude Desktop.</Overview>
+  <Category>Tools: System: Status:Stable</Category>
+  <WebUI>http://[IP]:[PORT:8080]/mcp</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/Bluscream/omni-mcp/main/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="HTTP MCP Port" Target="8080" Default="8080" Mode="tcp" Description="HTTP/SSE MCP Port for IDE connections" Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="Config Path" Target="/app/omni-mcp.toml" Default="/mnt/user/appdata/omni-mcp/omni-mcp.toml" Mode="ro" Description="Path to omni-mcp.toml configuration file" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/omni-mcp/omni-mcp.toml</Config>
+  <Config Name="OMNI_MCP_CONFIG" Target="OMNI_MCP_CONFIG" Default="/app/omni-mcp.toml" Description="Environment variable pointing to config file" Type="Variable" Display="advanced" Required="true" Mask="false">/app/omni-mcp.toml</Config>
+</Container>
