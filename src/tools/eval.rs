@@ -90,8 +90,57 @@ fn command_exists(cmd: &str) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
+}
+
+async fn build_command(
+    runtime: &Runtime,
+    script: &std::path::Path,
+    workspace: &std::path::Path,
+) -> ToolResult<(Command, String)> {
+    if runtime.names.contains(&"rust") {
+        if command_exists("rust-script") {
+            let mut cmd = Command::new("rust-script");
+            cmd.arg(script);
+            Ok((cmd, "rust-script".to_string()))
+        } else {
+            let out_bin = workspace.join("main_bin");
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "rustc \"$1\" -o \"$2\" && exec \"$2\"", "--"]);
+            cmd.arg(script);
+            cmd.arg(&out_bin);
+            Ok((cmd, "rustc".to_string()))
+        }
+    } else if runtime.names.contains(&"csharp") {
+        if command_exists("dotnet-script") {
+            let mut cmd = Command::new("dotnet-script");
+            cmd.arg(script);
+            Ok((cmd, "dotnet-script".to_string()))
+        } else {
+            let csproj = workspace.join("main.csproj");
+            let proj_xml = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+</Project>"#;
+            tokio::fs::write(&csproj, proj_xml)
+                .await
+                .map_err(|e| ToolError::Failed(format!("could not create .csproj: {e}")))?;
+
+            let mut cmd = Command::new("dotnet");
+            cmd.args(["run", "--project"]);
+            cmd.arg(&csproj);
+            Ok((cmd, "dotnet".to_string()))
+        }
+    } else {
+        let mut cmd = Command::new(runtime.program);
+        cmd.args(runtime.leading_args);
+        cmd.arg(script);
+        Ok((cmd, runtime.program.to_string()))
+    }
 }
 
 #[async_trait]
@@ -159,54 +208,8 @@ async fn evaluate(arguments: &Value) -> ToolResult<CallToolResult> {
         .await
         .map_err(|e| ToolError::Failed(format!("could not write the script: {e}")))?;
 
-    let mut command;
-    let backend_name: String;
+    let (mut command, backend_name) = build_command(runtime, &script, workspace.path()).await?;
 
-    if runtime.names.contains(&"rust") {
-        if command_exists("rust-script") {
-            backend_name = "rust-script".to_string();
-            command = Command::new("rust-script");
-            command.arg(&script);
-        } else {
-            backend_name = "rustc".to_string();
-            let out_bin = workspace.path().join("main_bin");
-            command = Command::new("sh");
-            command.arg("-c");
-            command.arg("rustc \"$1\" -o \"$2\" && exec \"$2\"");
-            command.arg("--");
-            command.arg(&script);
-            command.arg(&out_bin);
-        }
-    } else if runtime.names.contains(&"csharp") {
-        if command_exists("dotnet-script") {
-            backend_name = "dotnet-script".to_string();
-            command = Command::new("dotnet-script");
-            command.arg(&script);
-        } else {
-            backend_name = "dotnet".to_string();
-            let csproj = workspace.path().join("main.csproj");
-            let proj_xml = r#"<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
-</Project>"#;
-            tokio::fs::write(&csproj, proj_xml)
-                .await
-                .map_err(|e| ToolError::Failed(format!("could not create .csproj: {e}")))?;
-
-            command = Command::new("dotnet");
-            command.args(["run", "--project"]);
-            command.arg(&csproj);
-        }
-    } else {
-        backend_name = runtime.program.to_string();
-        command = Command::new(runtime.program);
-        command.args(runtime.leading_args);
-        command.arg(&script);
-    }
 
     command
         .current_dir(workspace.path())
