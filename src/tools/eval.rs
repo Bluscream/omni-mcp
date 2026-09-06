@@ -447,19 +447,59 @@ mod tests {
         }
     }
 
+    /// One runnable "hello" per supported language, keyed by canonical name.
+    ///
+    /// `every_supported_language_has_an_execution_test` below fails if a
+    /// runtime is added to `RUNTIMES` without adding a snippet here, so a new
+    /// language cannot ship untested.
+    const SNIPPETS: &[(&str, &str)] = &[
+        ("python", r#"print("ok")"#),
+        ("node", r#"console.log("ok")"#),
+        ("bash", "echo ok"),
+        ("sh", "echo ok"),
+        ("ruby", r#"puts "ok""#),
+        ("perl", r#"print "ok\n";"#),
+        ("php", "<?php echo \"ok\\n\";"),
+        ("lua", r#"print("ok")"#),
+        ("go", "package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"ok\")}"),
+        ("typescript", r#"console.log("ok")"#),
+        ("rust", r#"fn main(){println!("ok");}"#),
+        ("csharp", r#"System.Console.WriteLine("ok");"#),
+    ];
+
+    /// Whether the toolchain backing `language` is installed, accounting for
+    /// the script-runner fallbacks the compiled languages use.
+    fn toolchain_present(language: &str) -> bool {
+        let runtime = lookup(language).expect("snippet names a known language");
+        match language {
+            "rust" => which("rustc").is_some() || which("rust-script").is_some(),
+            "csharp" => which("dotnet").is_some() || which("dotnet-script").is_some(),
+            _ => which(runtime.program).is_some(),
+        }
+    }
+
     #[tokio::test]
-    async fn compiled_languages_run_via_their_fallback_toolchains() {
-        // rust-script / dotnet-script are usually absent, so this exercises the
-        // rustc and `dotnet run` fallbacks that actually get used in practice.
-        for (language, code, expected) in [
-            ("rust", r#"fn main(){println!("ok-rust");}"#, "ok-rust"),
-            ("csharp", r#"System.Console.WriteLine("ok-csharp");"#, "ok-csharp"),
-        ] {
-            let available = match language {
-                "rust" => which("rustc").is_some() || which("rust-script").is_some(),
-                _ => which("dotnet").is_some() || which("dotnet-script").is_some(),
-            };
-            if !available {
+    async fn every_supported_language_has_an_execution_test() {
+        // Guard against a language being added to RUNTIMES with no coverage.
+        let covered: Vec<&str> = SNIPPETS.iter().map(|(name, _)| *name).collect();
+        for runtime in RUNTIMES {
+            let canonical = runtime.names[0];
+            assert!(
+                covered.contains(&canonical),
+                "language {canonical:?} has no entry in SNIPPETS; add one so it is tested"
+            );
+        }
+        assert_eq!(covered.len(), RUNTIMES.len(), "SNIPPETS and RUNTIMES disagree");
+    }
+
+    #[tokio::test]
+    async fn each_supported_language_actually_runs() {
+        let mut exercised = Vec::new();
+        let mut skipped = Vec::new();
+
+        for (language, code) in SNIPPETS {
+            if !toolchain_present(language) {
+                skipped.push(*language);
                 continue;
             }
 
@@ -474,25 +514,27 @@ mod tests {
             match outcome {
                 Ok(result) => {
                     let out = result.structured_content.unwrap();
+                    let stdout = out["stdout"].as_str().unwrap_or_default();
                     assert_eq!(
                         out["exit_code"],
                         0,
-                        "{language} failed: {}",
+                        "{language} exited non-zero; stderr: {}",
                         out["stderr"].as_str().unwrap_or_default()
                     );
-                    assert!(
-                        out["stdout"].as_str().unwrap_or_default().contains(expected),
-                        "{language} produced {:?}",
-                        out["stdout"]
-                    );
+                    assert!(stdout.contains("ok"), "{language} printed {stdout:?}");
+                    exercised.push(*language);
                 }
-                // A toolchain present but unusable must degrade, never panic.
+                // Present but unusable (e.g. a broken install) must degrade
+                // cleanly rather than panicking.
                 Err(err) => assert!(
                     matches!(err, ToolError::Unavailable { .. } | ToolError::Timeout { .. }),
                     "{language}: unexpected {err:?}"
                 ),
             }
         }
+
+        eprintln!("eval languages exercised: {exercised:?}; skipped (absent): {skipped:?}");
+        assert!(!exercised.is_empty(), "no interpreter was available to test against");
     }
 
     #[tokio::test]
