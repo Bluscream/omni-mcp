@@ -22,7 +22,47 @@ use crate::protocol::{CallToolResult, Tool};
 
 // ── Tool descriptor ──────────────────────────────────────────────────────────
 
-pub fn descriptor() -> Tool {
+pub fn descriptor(mismatch_active: bool) -> Tool {
+    let mut props = json!({
+        "uploads": {
+            "type": "array",
+            "description": "Files or directories to upload (local → remote). Each item must have `local` and `remote` string fields. Globs in `local` are expanded recursively.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "local":  { "type": "string", "description": "Local path or glob pattern" },
+                    "remote": { "type": "string", "description": "Remote destination path (file or directory)" }
+                },
+                "required": ["local", "remote"]
+            }
+        },
+        "downloads": {
+            "type": "array",
+            "description": "Files or directories to download (remote → local). Each item must have `remote` and `local` string fields.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "remote": { "type": "string", "description": "Remote path (file or directory)" },
+                    "local":  { "type": "string", "description": "Local destination path" }
+                },
+                "required": ["remote", "local"]
+            }
+        },
+        "server": {
+            "type": "string",
+            "description": "Server profile name from omni-mcp.toml (optional; defaults to first configured server)"
+        }
+    });
+
+    if mismatch_active {
+        props["save_new_fingerprint"] = json!({
+            "type": "boolean",
+            "description": "A host key fingerprint mismatch was detected on a previous connection attempt. \
+                            Set to true to acknowledge the new key and re-pin it as trusted. \
+                            Only valid while a mismatch is pending; ignored otherwise."
+        });
+    }
+
     Tool::new(
         "ssh_transfer",
         "Upload and/or download files or entire directory trees between the local machine and an \
@@ -31,40 +71,7 @@ pub fn descriptor() -> Tool {
          Access is denied unless `tools.allow_ssh = true` is set in omni-mcp.toml.",
         json!({
             "type": "object",
-            "properties": {
-                "uploads": {
-                    "type": "array",
-                    "description": "Files or directories to upload (local → remote). Each item must have `local` and `remote` string fields. Globs in `local` are expanded recursively.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "local":  { "type": "string", "description": "Local path or glob pattern" },
-                            "remote": { "type": "string", "description": "Remote destination path (file or directory)" }
-                        },
-                        "required": ["local", "remote"]
-                    }
-                },
-                "downloads": {
-                    "type": "array",
-                    "description": "Files or directories to download (remote → local). Each item must have `remote` and `local` string fields.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "remote": { "type": "string", "description": "Remote path (file or directory)" },
-                            "local":  { "type": "string", "description": "Local destination path" }
-                        },
-                        "required": ["remote", "local"]
-                    }
-                },
-                "server": {
-                    "type": "string",
-                    "description": "Server profile name from omni-mcp.toml (optional; defaults to first configured server)"
-                },
-                "save_new_fingerprint": {
-                    "type": "boolean",
-                    "description": "Set to true to acknowledge and re-pin the host key when a fingerprint mismatch is detected"
-                }
-            }
+            "properties": props
         }),
     )
 }

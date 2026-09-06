@@ -92,14 +92,31 @@ impl SshTools {
 
         Ok(())
     }
+
+    /// Returns true if any configured server has a pending host-key fingerprint mismatch.
+    fn any_mismatch_pending(&self) -> bool {
+        self.pool.any_mismatch()
+    }
+
+    /// Returns true if the named server (or default) has a pending mismatch.
+    fn server_has_mismatch(&self, name: Option<&str>) -> bool {
+        let Some(server_name) = name.or(self.default_server.as_deref()) else {
+            return false;
+        };
+        self.pool.has_mismatch(server_name)
+    }
 }
 
 #[async_trait]
 impl NativeTool for SshTools {
     fn descriptors(&self) -> Vec<Tool> {
+        // Include save_new_fingerprint in schemas only when at least one server
+        // has a pending mismatch. That way the agent sees it exactly when it's needed.
+        let mismatch_active = self.any_mismatch_pending();
+
         let mut tools = Vec::with_capacity(4);
-        tools.push(execute_descriptor());
-        tools.push(transfer::descriptor());
+        tools.push(execute_descriptor(mismatch_active));
+        tools.push(transfer::descriptor(mismatch_active));
         tools.push(list_descriptor());
         tools
     }
@@ -124,7 +141,11 @@ impl SshTools {
         };
 
         let server_name = args::opt_string(&arguments, "server")?;
-        let save_fp = args::bool_or(&arguments, "save_new_fingerprint", false)?;
+
+        // Only honour save_new_fingerprint when a real mismatch is pending for this server.
+        let save_fp = self.server_has_mismatch(server_name)
+            && args::bool_or(&arguments, "save_new_fingerprint", false)?;
+
         let config = self.resolve_server(server_name)?;
         Self::validate_command(config, cmd)?;
 
@@ -155,9 +176,12 @@ impl SshTools {
 
     async fn transfer(&self, arguments: Value, ctx: &ToolContext) -> ToolResult<CallToolResult> {
         let server_name = args::opt_string(&arguments, "server")?;
-        let save_fp = args::bool_or(&arguments, "save_new_fingerprint", false)?;
-        let config = self.resolve_server(server_name)?;
 
+        // Only honour save_new_fingerprint when a real mismatch is pending for this server.
+        let save_fp = self.server_has_mismatch(server_name)
+            && args::bool_or(&arguments, "save_new_fingerprint", false)?;
+
+        let config = self.resolve_server(server_name)?;
         let session_arc = self.pool.get_or_connect(config, save_fp).await?;
         transfer::run(&arguments, ctx, config, &session_arc).await
     }
@@ -169,6 +193,7 @@ impl SshTools {
         for config in self.servers.values() {
             let connected = self.pool.is_connected(&config.name).await;
             let status = cache.get(&config.name).cloned();
+            let mismatch = self.pool.has_mismatch(&config.name);
 
             list.push(json!({
                 "name": config.name,
@@ -176,6 +201,7 @@ impl SshTools {
                 "port": config.port,
                 "username": config.user,
                 "connected": connected,
+                "fingerprint_mismatch_pending": mismatch,
                 "status": status,
             }));
         }
@@ -184,31 +210,38 @@ impl SshTools {
     }
 }
 
-fn execute_descriptor() -> Tool {
+fn execute_descriptor(mismatch_active: bool) -> Tool {
+    let mut props = json!({
+        "cmd": {
+            "type": "string",
+            "description": "Command to execute on the remote host"
+        },
+        "cmdString": {
+            "type": "string",
+            "description": "Alias for cmd (legacy compatibility)"
+        },
+        "server": {
+            "type": "string",
+            "description": "Server profile name from omni-mcp.toml (optional; defaults to first configured server)"
+        }
+    });
+
+    if mismatch_active {
+        props["save_new_fingerprint"] = json!({
+            "type": "boolean",
+            "description": "A host key fingerprint mismatch was detected on a previous connection attempt. \
+                            Set to true to acknowledge the new key and re-pin it as trusted. \
+                            Only valid while a mismatch is pending; ignored otherwise."
+        });
+    }
+
     Tool::new(
         "ssh_execute",
         "Execute a shell command on a configured SSH server and return stdout, stderr, and exit \
          code. Access is denied unless `tools.allow_ssh = true` is set in omni-mcp.toml.",
         json!({
             "type": "object",
-            "properties": {
-                "cmd": {
-                    "type": "string",
-                    "description": "Command to execute on the remote host"
-                },
-                "cmdString": {
-                    "type": "string",
-                    "description": "Alias for cmd (legacy compatibility)"
-                },
-                "server": {
-                    "type": "string",
-                    "description": "Server profile name from omni-mcp.toml (optional; defaults to first configured server)"
-                },
-                "save_new_fingerprint": {
-                    "type": "boolean",
-                    "description": "Set to true to acknowledge and re-pin the host key when a fingerprint mismatch is detected"
-                }
-            }
+            "properties": props
         }),
     )
 }
@@ -217,7 +250,8 @@ fn list_descriptor() -> Tool {
     Tool::new(
         "ssh_list_servers",
         "List all configured SSH servers with connection status and verbose hardware/system \
-         telemetry (CPU, RAM, disk, GPU, OS, uptime, processes, services).",
+         telemetry (CPU, RAM, disk, GPU, OS, uptime, processes, services). \
+         Also reports `fingerprint_mismatch_pending` per server.",
         json!({ "type": "object", "properties": {} }),
     )
 }

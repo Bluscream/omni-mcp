@@ -102,10 +102,16 @@ pub struct SshSessionHandle {
 }
 
 impl SshSessionHandle {
+    /// Connects to an SSH server.
+    ///
+    /// On fingerprint mismatch `mismatch_out` is populated with `(pinned, received)` fingerprint
+    /// strings before returning `Err`. The pool uses this to record pending mismatch state so that
+    /// `save_new_fingerprint` can be offered and honoured on the next call.
     pub async fn connect(
         config: &SshServerConfig,
         known_hosts: Arc<KnownHostsStore>,
         save_new_fingerprint: bool,
+        mismatch_out: &std::sync::Mutex<Option<(String, String)>>,
     ) -> ToolResult<Self> {
         let verification = Arc::new(Mutex::new(None));
 
@@ -128,12 +134,15 @@ impl SshSessionHandle {
             Ok(Err(e)) => {
                 let v = verification.lock().await.clone();
                 if let Some(KeyVerification::Mismatch { pinned, received }) = v {
+                    // Record the mismatch so the pool can expose save_new_fingerprint.
+                    if let Ok(mut out) = mismatch_out.lock() {
+                        *out = Some((pinned.clone(), received.clone()));
+                    }
                     return Err(ToolError::Failed(format!(
                         "SECURITY WARNING: Host key fingerprint mismatch for server '{}' ({})! \
-                         Expected pinned fingerprint '{}', but received '{}'. \
+                         Expected '{}', but server presented '{}'. \
                          Possible host key rotation or Man-in-the-Middle hijacking! \
-                         If this host key change is expected, retry the call with 'save_new_fingerprint: true' \
-                         to trust and re-pin the new key.",
+                         Re-call with 'save_new_fingerprint: true' to acknowledge and re-pin the new key.",
                         config.name, addr, pinned, received
                     )));
                 }
